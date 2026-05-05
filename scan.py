@@ -1604,6 +1604,12 @@ def run_scan(args):
         return
 
     llm_backend = configure_llm_backend(args, keys)
+    effective_model = args.model
+    if llm_backend == "codex":
+        effective_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
+    elif llm_backend == "claude":
+        effective_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
+
     if llm_backend in ("codex", "claude"):
         parallel_explicit = getattr(args, "_parallel_explicit", False)
         triage_parallel_explicit = getattr(args, "_triage_parallel_explicit", False)
@@ -1703,7 +1709,7 @@ def run_scan(args):
         if skip_other:
             parts.append(f"{skip_other} unreadable")
         print(f"   ⏭️  {len(skipped)} skipped ({', '.join(parts)})")
-    print(f"🤖 Model: {args.model}")
+    print(f"🤖 Model: {effective_model}")
     if llm_backend == "codex":
         codex_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
         print(f"🔌 Backend: Codex CLI ({codex_model}, no API key required)")
@@ -2221,16 +2227,10 @@ def run_scan(args):
 
         triage_md_path = os.path.join(out_dir, "triage_survivors.md")
         with open(triage_md_path, "w") as f:
-            model_label = args.model
-            if llm_backend == "codex":
-                model_label = keys.get("_CODEX_MODEL") or "Codex CLI default"
-            elif llm_backend == "claude":
-                model_label = keys.get("_CLAUDE_MODEL") or "Claude Code default"
-
             f.write(f"# nano-analyzer triage survivors\n\n")
             f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
             f.write(f"- **Date**: {timestamp}\n")
-            f.write(f"- **Model**: {model_label}\n")
+            f.write(f"- **Model**: {effective_model}\n")
             f.write(f"- **Threshold**: {triage_threshold}+\n")
             f.write(f"- **Results**: ✅ {valid_count} valid | "
                     f"❌ {invalid_count} rejected | "
@@ -2248,12 +2248,6 @@ def run_scan(args):
         print(f"\n   📄 Triage writeup: {triage_md_path}")
 
     # Save summary
-    effective_model = args.model
-    if llm_backend == "codex":
-        effective_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
-    elif llm_backend == "claude":
-        effective_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
-
     summary = {
         "timestamp": timestamp,
         "target": os.path.abspath(args.path),
