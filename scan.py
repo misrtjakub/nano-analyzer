@@ -372,6 +372,72 @@ def _resolve_claude_cli(keys):
     return shutil.which(cli)
 
 
+def _clean_cli_setting(value):
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r'\x1b\[[0-9;]*m', '', value).strip()
+    value = re.sub(r'\[[0-9;]*m\]$', '', value).strip()
+    return value or None
+
+
+def _read_simple_toml_string(path, key):
+    """Best-effort parser for simple top-level `key = "value"` settings."""
+    try:
+        with open(path) as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    break
+                m = re.match(
+                    rf'{re.escape(key)}\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^#\s]+))',
+                    line,
+                )
+                if m:
+                    return _clean_cli_setting(next(g for g in m.groups() if g is not None))
+    except OSError:
+        return None
+    return None
+
+
+def _codex_config_path():
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    return os.path.join(codex_home, "config.toml")
+
+
+def _claude_settings_path():
+    claude_home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(claude_home, "settings.json")
+
+
+def _read_json_setting(path, key):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _clean_cli_setting(data.get(key))
+
+
+def _codex_config_model():
+    return _read_simple_toml_string(_codex_config_path(), "model")
+
+
+def _codex_config_effort():
+    return _read_simple_toml_string(_codex_config_path(), "model_reasoning_effort")
+
+
+def _claude_settings_model():
+    return _read_json_setting(_claude_settings_path(), "model")
+
+
+def _claude_settings_effort():
+    return _read_json_setting(_claude_settings_path(), "effortLevel")
+
+
 def _looks_like_claude_model(model):
     return model in CLAUDE_MODEL_ALIASES or model.startswith("claude-")
 
@@ -420,6 +486,14 @@ def configure_llm_backend(args, keys):
     if backend == "codex" and not codex_model:
         codex_model = os.environ.get("NANO_ANALYZER_CODEX_MODEL")
     keys["_CODEX_MODEL"] = codex_model
+    keys["_CODEX_EFFECTIVE_MODEL"] = (
+        codex_model
+        if backend == "codex" and codex_model
+        else _codex_config_model() if backend == "codex" else None
+    )
+    keys["_CODEX_REASONING_EFFORT"] = (
+        _codex_config_effort() if backend == "codex" else None
+    )
 
     claude_model = args.claude_model
     if (
@@ -431,6 +505,16 @@ def configure_llm_backend(args, keys):
     if backend == "claude" and not claude_model:
         claude_model = os.environ.get("NANO_ANALYZER_CLAUDE_MODEL")
     keys["_CLAUDE_MODEL"] = claude_model
+    keys["_CLAUDE_EFFECTIVE_MODEL"] = (
+        claude_model
+        if backend == "claude" and claude_model
+        else _claude_settings_model() if backend == "claude" else None
+    )
+    keys["_CLAUDE_EFFECTIVE_EFFORT"] = (
+        keys.get("_CLAUDE_EFFORT")
+        if backend == "claude" and keys.get("_CLAUDE_EFFORT")
+        else _claude_settings_effort() if backend == "claude" else None
+    )
 
     if backend == "codex":
         codex_cli = _resolve_codex_cli(keys)
@@ -1606,9 +1690,13 @@ def run_scan(args):
     llm_backend = configure_llm_backend(args, keys)
     effective_model = args.model
     if llm_backend == "codex":
-        effective_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
+        effective_model = keys.get("_CODEX_EFFECTIVE_MODEL") or "Codex CLI default"
+        effective_effort = keys.get("_CODEX_REASONING_EFFORT")
     elif llm_backend == "claude":
-        effective_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
+        effective_model = keys.get("_CLAUDE_EFFECTIVE_MODEL") or "Claude Code default"
+        effective_effort = keys.get("_CLAUDE_EFFECTIVE_EFFORT")
+    else:
+        effective_effort = None
 
     if llm_backend in ("codex", "claude"):
         parallel_explicit = getattr(args, "_parallel_explicit", False)
@@ -1711,13 +1799,11 @@ def run_scan(args):
         print(f"   ⏭️  {len(skipped)} skipped ({', '.join(parts)})")
     print(f"🤖 Model: {effective_model}")
     if llm_backend == "codex":
-        codex_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
-        print(f"🔌 Backend: Codex CLI ({codex_model}, no API key required)")
+        effort_str = f", effort {effective_effort}" if effective_effort else ""
+        print(f"🔌 Backend: Codex CLI ({effective_model}{effort_str}, no API key required)")
     elif llm_backend == "claude":
-        claude_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
-        effort = keys.get("_CLAUDE_EFFORT")
-        effort_str = f", effort {effort}" if effort else ""
-        print(f"🔌 Backend: Claude Code ({claude_model}{effort_str}, no API key required)")
+        effort_str = f", effort {effective_effort}" if effective_effort else ""
+        print(f"🔌 Backend: Claude Code ({effective_model}{effort_str}, no API key required)")
     else:
         print("🔌 Backend: Chat Completions API")
     print(f"⚡ Parallelism: {args.parallel} scan, {args.triage_parallel} triage")
@@ -2231,6 +2317,8 @@ def run_scan(args):
             f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
             f.write(f"- **Date**: {timestamp}\n")
             f.write(f"- **Model**: {effective_model}\n")
+            if effective_effort:
+                f.write(f"- **Effort**: {effective_effort}\n")
             f.write(f"- **Threshold**: {triage_threshold}+\n")
             f.write(f"- **Results**: ✅ {valid_count} valid | "
                     f"❌ {invalid_count} rejected | "
@@ -2253,10 +2341,16 @@ def run_scan(args):
         "target": os.path.abspath(args.path),
         "model": args.model,
         "effective_model": effective_model,
+        "effective_effort": effective_effort,
         "backend": llm_backend,
         "codex_model": keys.get("_CODEX_MODEL") if llm_backend == "codex" else None,
+        "codex_reasoning_effort": (
+            keys.get("_CODEX_REASONING_EFFORT") if llm_backend == "codex" else None
+        ),
         "claude_model": keys.get("_CLAUDE_MODEL") if llm_backend == "claude" else None,
-        "claude_effort": keys.get("_CLAUDE_EFFORT") if llm_backend == "claude" else None,
+        "claude_effort": (
+            keys.get("_CLAUDE_EFFECTIVE_EFFORT") if llm_backend == "claude" else None
+        ),
         "respect_gitignore": not args.include_ignored,
         "files_scanned": len(results),
         "total_lines": total_lines,
@@ -2286,6 +2380,8 @@ def run_scan(args):
         f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
         f.write(f"- **Date**: {timestamp}\n")
         f.write(f"- **Model**: {effective_model}\n")
+        if effective_effort:
+            f.write(f"- **Effort**: {effective_effort}\n")
         f.write(f"- **Backend**: {llm_backend}\n")
         f.write(f"- **Respect gitignore**: {str(not args.include_ignored).lower()}\n")
         f.write(f"- **Files scanned**: {len(results)} ({total_lines:,} lines)\n")

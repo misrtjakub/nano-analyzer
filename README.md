@@ -93,6 +93,11 @@ for the same scan and triage calls. Like Codex mode, the default scan and
 triage parallelism is capped at 4 local CLI processes unless you pass explicit
 `--parallel` / `--triage-parallel` values.
 
+When no CLI model override is passed, nano-analyzer shows the configured local
+default when it can infer it from Codex's `~/.codex/config.toml` or Claude
+Code's `~/.claude/settings.json`. If no setting is found, the summary falls
+back to `Codex CLI default` or `Claude Code default`.
+
 With the default `--backend auto`, OpenAI-style model names use the API when
 `OPENAI_API_KEY` is set. If no OpenAI key is present and `codex` is available,
 the scanner falls back to Codex CLI automatically. If Codex is unavailable and
