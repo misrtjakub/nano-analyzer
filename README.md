@@ -9,17 +9,29 @@ through locally authenticated coding CLIs without requiring API keys.
 
 ![aisle-nano-analyzer-diagram](aisle-nano-analyzer.png)
 
-> **Research prototype for demonstration purposes.** This is a simple, single-file harness that is able to detect real zero-day vulnerabilities. Note that it is a prototype, biased towards C/C++ memory safety bugs, and will produce false positives. We are sharing it as-is in the spirit of open research — expect sharp corners.
+> **Research prototype for demonstration purposes.** This is a simple, single-file harness that is able to detect real zero-day vulnerabilities. It now uses language-aware profiles, but it is still a prototype and will produce false positives. We are sharing it as-is in the spirit of open research — expect sharp corners.
 
 ## What it does
 
-Nano-analyzer is a simple single-file Python scanner that sends source code through a three-stage LLM pipeline:
+Nano-analyzer is a simple single-file Python scanner that sends source code through a language-profile-driven three-stage LLM pipeline:
 
-1. **Context generation** — a model writes a security briefing about the file: what it does, where untrusted data flows, which buffers exist and how big they are.
-2. **Vulnerability scan** — the same model, primed with the context, hunts for zero-day bugs function by function and outputs structured findings.
-3. **Skeptical triage** — each finding is challenged over multiple rounds by a skeptical reviewer that can grep the codebase to verify (or refute) defenses. An arbiter makes the final call.
+1. **Context generation** — a model writes a profile-specific security briefing about the file: entry points, untrusted data, validators, authz checks, dangerous sinks, and cross-file facts to verify.
+2. **Vulnerability scan** — the same model, primed with the context and a language-specific few-shot example, hunts for zero-day bugs and outputs structured findings.
+3. **Skeptical triage** — each finding is challenged over multiple rounds by a skeptical reviewer that can grep the relevant ecosystem files to verify (or refute) defenses. An arbiter makes the final call.
 
 Results are saved as Markdown and JSON files for human review.
+
+## Language profiles
+
+The scanner infers a profile from the file path and tunes prompts, code fences,
+few-shot examples, triage rules, and grep globs accordingly:
+
+- **C/C++** (`.c`, `.h`, `.cc`, `.cpp`, `.hpp`, etc.) — memory safety and parser boundaries.
+- **TypeScript/JavaScript** (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`) — source-to-sink web/backend issues such as SSRF, injection, path traversal, authz, redirects, and secrets leakage.
+- **Python** (`.py`, `.pyi`) — framework entry points, subprocess/code execution, deserialization, SQL injection, SSRF, path traversal, authz, and secrets leakage.
+- **Shell** (`.sh`, `.bash`, `.zsh`) — command construction, quoting, option/path injection, unsafe temp files, destructive commands, and CI/deploy boundaries.
+- **CI/CD and containers** (`.yml`, `.yaml`, `Dockerfile`, `Containerfile`) — privileged workflow triggers, secrets, token permissions, artifact/cache poisoning, deployment, and build hazards.
+- **Generic source/config** (`.java`, `.go`, `.rs`, `.rb`, `.php`, `.toml`, `.ini`, `.cfg`, etc.) — broad source-to-sink security review.
 
 ## Credit
 
@@ -33,10 +45,10 @@ documentation for no-API-key workflows.
 
 This is a v0.1 prototype. Please keep the following in mind:
 
-- **C/C++ bias.** The prompts, few-shot examples, and heuristics are heavily tuned for C/C++ memory safety vulnerabilities (buffer overflows, NULL derefs, integer overflows, type confusion). It will scan other languages but is much less effective there.
+- **Profile coverage is uneven.** C/C++, TypeScript/JavaScript, Python, shell, CI/YAML, and Dockerfile paths have dedicated profiles. Other languages use a generic source-to-sink profile.
 - **False positives.** Even with multi-round triage, expect findings that don't hold up on closer inspection. Always verify manually.
 - **False negatives.** The scanner can miss entire vulnerability classes — logic bugs, race conditions, cryptographic issues, authentication bypasses, etc. A clean scan does not mean the code is safe.
-- **Single-file analysis.** Each file is scanned independently. Cross-file vulnerabilities that depend on interactions between compilation units will likely be missed.
+- **Mostly single-file analysis.** Each file is scanned independently, with a compact repo manifest summary and grep-based triage for cross-file facts. Deep cross-file vulnerabilities can still be missed.
 - **LLM-dependent.** Results vary with the model used. Different models will find different things and hallucinate different false positives.
 
 ## Setup
@@ -45,7 +57,7 @@ This is a v0.1 prototype. Please keep the following in mind:
 
 - Python 3.8+
 - Codex CLI or Claude Code logged in locally, or an OpenAI/OpenRouter API key
-- Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for triage grep lookups
+- Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for faster triage grep lookups
 - Optional: [Google codesearch](https://github.com/google/codesearch) (`csearch`/`cindex`) for faster grep on large repos
 
 ### Install

@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import random
@@ -71,10 +72,14 @@ DEFAULT_CLAUDE_PARALLEL = 4
 DEFAULT_MAX_CHARS = 200_000
 DEFAULT_EXTENSIONS = {
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx",
-    ".java", ".py", ".go", ".rs", ".js", ".ts", ".rb",
-    ".swift", ".m", ".mm", ".cs", ".php", ".pl", ".sh",
+    ".java", ".py", ".pyi", ".go", ".rs",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".rb", ".swift", ".m", ".mm", ".cs", ".php", ".pl",
+    ".sh", ".bash", ".zsh", ".yml", ".yaml", ".dockerfile",
+    ".toml", ".ini", ".cfg",
     ".x",
 }
+DEFAULT_FILENAMES = {"Dockerfile", "Containerfile"}
 DEFAULT_SKIP_DIRS = {
     ".agents",
     ".cache",
@@ -117,31 +122,309 @@ SEVERITY_EMOJI = {
 # Prompt templates
 # ---------------------------------------------------------------------------
 
-DEFAULT_SYSTEM_PROMPT = """\
-You are a security researcher hunting for zero-day vulnerabilities. \
-Analyze the code step by step, tracing how untrusted data flows into \
-each function. For every function, ask yourself:
+C_SECURITY_FOCUS = """\
+For C/C++, prioritize memory-safety and parser boundary bugs:
+- fixed-size buffer overflows and unterminated strings
+- integer overflow, signedness, truncation, and size/index confusion
+- NULL dereferences only when externally reachable and security-relevant
+- use-after-free, double-free, lifetime bugs, and ownership confusion
+- tagged union / variant access without discriminator validation
+- unchecked return values from fallible allocators, parsers, and I/O
+- path traversal, command injection, and unsafe file handling where present
 
-1. Can any parameter be NULL, too large, negative, or otherwise \
-   invalid when this function is called with malformed input?
-2. Are there copies into fixed-size buffers without size validation?
-3. Can integer arithmetic overflow, wrap, or produce negative values \
-   that are then used as sizes or indices?
-4. Are tagged unions / variant types accessed without verifying the \
-   type discriminator first?
-5. Are return values from fallible operations checked before use?
-
-Focus on bugs that an external attacker can trigger through untrusted \
-input. Deprioritize static helpers with safe call sites, allocation \
-wrappers, platform-specific dead code, and theoretical issues.
-
-After your analysis, output a JSON array of findings. Each finding \
-must have severity, title, function, and description. Output ONLY \
-the JSON array at the end — your reasoning goes before it.\
+Focus on bugs that external attacker-controlled input can trigger. \
+Deprioritize static helpers with safe call sites, platform-specific dead \
+code, and crashes with no meaningful security impact.\
 """
 
-FEWSHOT_EXAMPLE_USER = """\
-Analyze the following source file for zero-day vulnerabilities.
+TS_JS_SECURITY_FOCUS = """\
+Trace attacker-controlled data from routes, handlers, server actions, \
+query params, request bodies, cookies, headers, webhooks, job queues, \
+and uploaded files.
+
+Prioritize:
+- command injection: child_process.exec, execSync, spawn with shell=true
+- SQL/NoSQL injection: raw queries, string-built where clauses, Mongo operators
+- SSRF: fetch/axios/got/request using attacker-controlled URLs
+- path traversal: fs.readFile/writeFile/sendFile using user paths
+- authz bugs: IDOR, tenant bypass, missing ownership checks
+- XSS/template injection: dangerouslySetInnerHTML, template engines
+- open redirect: redirect(userControlledUrl)
+- prototype pollution: unsafe merge/deep assignment into objects
+- unsafe deserialization/parsing: yaml, qs, JSON with dynamic behavior
+- secrets leakage: logs, error responses, client bundles
+- CORS/CSRF/session/JWT misconfiguration when a security boundary is clear
+
+Do not report ordinary TypeScript type errors, null derefs, or crashes \
+unless an external attacker can trigger meaningful harm.\
+"""
+
+PY_SECURITY_FOCUS = """\
+Trace attacker-controlled data from Flask/Django/FastAPI routes, CLI args, \
+files, queues, webhooks, environment variables, and deserialized input.
+
+Prioritize:
+- command injection: subprocess(..., shell=True), os.system, popen
+- code execution: eval, exec, compile, importlib on user input
+- deserialization: pickle, marshal, yaml.load, unsafe json/object hooks
+- SQL injection: raw SQL, f-strings, string concatenation
+- SSRF: requests/httpx/urllib using attacker-controlled URLs
+- path traversal: open/send_file/Path joins/archive extraction
+- template injection: Jinja/Django templates with user-controlled templates
+- authz bugs: missing object ownership, tenant boundary bypass
+- mass assignment: model update from request dict
+- XXE/XML/parser issues
+- insecure crypto/token/session handling
+- secrets leakage in logs or responses
+
+Do not report ordinary exceptions or crashes unless the attacker can \
+turn them into meaningful denial of service, code execution, data access, \
+or privilege boundary impact.\
+"""
+
+SH_SECURITY_FOCUS = """\
+Trace attacker-controlled data from argv, env vars, filenames, CI variables, \
+git branch names, PR titles, config files, and network data.
+
+Prioritize:
+- command injection via eval, sh -c, backticks, $(), unquoted variables
+- option injection: user values passed before -- to tools
+- path injection: PATH-controlled command lookup, relative executable names
+- unsafe temp files: predictable /tmp paths, symlink races
+- unsafe globbing/word splitting
+- unsafe curl | sh / wget | sh flows
+- archive extraction traversal
+- secrets exposure in set -x, logs, artifacts
+- rm/chown/chmod with attacker-controlled paths
+- CI/CD privilege boundary bugs
+
+A shell finding is VALID only if the attacker controls the variable or \
+filename and the script runs in a privileged or security-sensitive context.\
+"""
+
+CI_SECURITY_FOCUS = """\
+Trace attacker-controlled data through CI/CD workflows, workflow_dispatch \
+inputs, pull_request contexts, branch names, tags, artifact names, cache \
+keys, matrix values, environment variables, and deployment configuration.
+
+Prioritize:
+- script or expression injection in run steps
+- privileged pull_request_target misuse with untrusted checkout or artifacts
+- overly broad permissions, token exposure, and secret leakage
+- cache/artifact poisoning across trust boundaries
+- deployment steps reachable from untrusted refs
+- unsafe Docker build args, ADD/COPY of untrusted content, and curl | sh
+- compose/config settings that expose admin ports, credentials, or volumes
+
+Do not report generic hardening advice unless a concrete privilege boundary \
+or attacker-controlled value reaches a sensitive sink.\
+"""
+
+GENERIC_SECURITY_FOCUS = """\
+Trace attacker-controlled data from public entry points to dangerous sinks. \
+Prioritize injection, path traversal, SSRF, unsafe deserialization, authz \
+bypass, secrets exposure, unsafe file handling, and privilege-boundary bugs. \
+Do not report pure type errors, ordinary exceptions, or hardening advice \
+unless there is a concrete security impact.\
+"""
+
+C_CONTEXT_CHECKLIST = """\
+Identify:
+1. Public API, parser, syscall, file, network, or library entry points
+2. Attacker-controlled parameters and buffers, traced to their sources
+3. Fixed-size buffers and named size constants; use GREP to resolve values
+4. Dangerous copies, arithmetic, casts, indexes, and allocation sizes
+5. NULL/lifetime ownership assumptions and unchecked fallible returns
+6. Tagged unions or variants and the discriminator checks protecting them
+7. Static helpers vs exported functions and whether callers are safe
+8. Cross-file facts needed: constants, callers, wrappers, allocators
+9. Likely bug classes for this file\
+"""
+
+TS_JS_CONTEXT_CHECKLIST = """\
+Identify:
+1. Framework/runtime: Express, Next.js, Nest, Remix, tRPC, serverless, CLI, worker
+2. Entry points: routes, API handlers, server actions, webhooks, queue consumers
+3. Attacker-controlled fields: req.params, req.query, req.body, headers, cookies
+4. Validators/sanitizers: zod, joi, yup, class-validator, custom guards
+5. Auth/authz checks: middleware, session checks, tenant/owner checks
+6. Dangerous sinks: child_process, fs, path, fetch/axios, raw SQL, redirects, templates
+7. Cross-file facts needed: callers, route registration, middleware chain, schemas
+8. Likely bug classes for this file\
+"""
+
+PY_CONTEXT_CHECKLIST = """\
+Identify:
+1. Framework/runtime: Django, Flask, FastAPI, Celery, CLI, lambda, library
+2. Entry points: routes, management commands, queue tasks, file parsers
+3. Attacker-controlled fields: request args/body/files/headers/cookies, argv, env
+4. Validators/sanitizers: pydantic, forms, serializers, regex checks, allowlists
+5. Auth/authz checks: decorators, dependencies, permission classes, ownership checks
+6. Dangerous sinks: subprocess, eval/exec, pickle/yaml, open/pathlib, requests, SQL
+7. Cross-file facts needed: URL routing, dependency injection, serializers, settings
+8. Likely bug classes for this file\
+"""
+
+SH_CONTEXT_CHECKLIST = """\
+Identify:
+1. Invocation context: local script, CI job, install script, deployment script, cron
+2. Attacker-controlled variables: argv, env, filenames, branch names, config values
+3. Privilege boundary: root, CI token, deploy key, production credentials
+4. Quoting/word-splitting hazards
+5. Command-construction hazards
+6. File/path hazards
+7. External tools invoked and whether -- is used before user paths
+8. Likely bug classes for this script\
+"""
+
+CI_CONTEXT_CHECKLIST = """\
+Identify:
+1. Invocation context: GitHub Actions, CI job, Docker build, compose, deployment
+2. Untrusted inputs: PR metadata, branch names, workflow inputs, artifacts, cache keys
+3. Privilege boundary: secrets, write tokens, deploy keys, production credentials
+4. Permission and trigger model: pull_request vs pull_request_target, workflow_dispatch
+5. Command-construction hazards in run/script blocks
+6. Artifact/cache poisoning and cross-job trust assumptions
+7. Dockerfile hazards: root user, curl | sh, secret build args, unsafe ADD/COPY
+8. Likely bug classes for this file\
+"""
+
+GENERIC_CONTEXT_CHECKLIST = """\
+Identify:
+1. Runtime/framework and externally reachable entry points
+2. Attacker-controlled variables, fields, files, config, and environment data
+3. Validators, sanitizers, authorization checks, and privilege boundaries
+4. Dangerous sinks: command execution, file/path APIs, network requests, raw queries
+5. Cross-file facts needed: callers, registration, settings, wrappers, schemas
+6. Likely source-to-sink bug classes for this file\
+"""
+
+SCAN_SYSTEM_PROMPT_TEMPLATE = """\
+You are a security researcher hunting for zero-day vulnerabilities in \
+{language_name} code. Analyze the code step by step by tracing untrusted \
+data from source to sink.
+
+{focus}
+
+After your analysis, output a JSON array of findings. Each finding must \
+have severity, title, function, and description. Output ONLY the JSON \
+array at the end; your reasoning goes before it.\
+"""
+
+CONTEXT_GEN_PROMPT_TEMPLATE = """\
+You are preparing a security briefing for a vulnerability researcher \
+reviewing {language_name} code. Write a concise (~250 word) context \
+briefing. Do not find vulnerabilities; provide context.
+
+Context checklist:
+{context_checklist}
+
+Known repository facts:
+{repo_context}
+
+Name actual variables, functions, routes, settings, validators, and \
+constants from the code. Use your training knowledge of this project \
+where helpful, but verify specifics.
+
+GREP TOOL: You can search the codebase by including GREP: pattern in \
+your response. Use this to look up constants, callers, route registration, \
+middleware, validators, schemas, settings, wrappers, or cross-file data \
+flow. The results will be appended to your briefing.\
+"""
+
+TRIAGE_PROMPT_TEMPLATE = """\
+A vulnerability scanner flagged this in {project_name}. Is it real?
+
+Be skeptical — most scanner findings are false positives.
+
+RULES:
+- VALID: the bug is real AND an external attacker can trigger it to \
+  cause meaningful harm (crash, code execution, data corruption, auth \
+  bypass). The attacker must control the input that triggers the bug.
+- INVALID: the bug pattern does not exist, OR it is not attacker-reachable \
+  (only trusted internal callers), OR a concrete defense prevents it, \
+  OR it is a code quality issue not a security vulnerability (e.g. \
+  data race on diagnostic state, missing NULL check on internal-only \
+  API, undefined behavior only in debug builds).
+- UNCERTAIN: only if you genuinely cannot determine.
+
+ABSENCE OF DEFENSE: If the bug pattern clearly exists, the input \
+comes from an untrusted source, and you searched for a defense but \
+did not find one, lean toward VALID rather than UNCERTAIN. Not \
+having verified every upstream caller is not a reason to mark \
+UNCERTAIN — only cite a defense if you can name the specific \
+function and show it is sufficient.
+
+CRITICAL: When you cite any defense — a size limit, NULL check, type \
+validation, schema, sanitizer, authorization check, path normalization, \
+or quoting/argv construction — you must verify it actually works. Look \
+up the actual values or code. Show your work. "There \
+exists a bound" is NOT the same as "the bound is sufficient." Never \
+skip the verification step.
+
+FOLLOW CROSS-FILE FACTS: When you encounter a named constant, wrapper, \
+schema, middleware, sanitizer, settings value, or helper in code or \
+grep results, you MUST grep for its definition or callers before \
+concluding. A name is not a verified defense. If a function receives a \
+validated parameter, grep for its callers to see what they pass.
+
+IMPORTANT: If your own analysis leads to a conclusion, do not then \
+contradict it in the same response. If you verify a defense and find \
+it insufficient, that is your answer — do not keep searching for \
+reasons to change your mind. Trust your own reasoning.
+
+If you believe a defense exists that you haven't verified, you must \
+either name the specific function/line that implements it or grep \
+for it. Vague references to "assumptions in this codebase" or \
+"other code probably handles this" are not valid defenses. If you \
+cannot point to it or find it, it does not exist.
+
+GREP TOOL: Include a grep pattern in the JSON to search the codebase. \
+Use this to look up values, check implementations, and verify defenses. \
+GREP PATTERNS: Use function/variable/constant/schema/middleware names \
+as patterns, e.g. "MAX_BUF_SIZE", "parse_input(", "requireAuth", \
+"UserSchema", "subprocess", "sendFile". Do NOT prefix patterns with \
+file paths like "src/foo/bar.ts:symbol" — that searches for the literal \
+string inside files and will return nothing. To find callers of a \
+function, grep for its name.
+
+Language-specific triage:
+{triage_rules}
+
+Use your knowledge of {project_name} for intuition, but verify \
+specifics via grep. Do not invent defenses.
+
+Respond ONLY with JSON:
+{{"reasoning": "Analyze the evidence. State your conclusion clearly.", \
+"crux": "the single key fact the verdict depends on", \
+"grep": "search_pattern to verify the crux", \
+"verdict": "VALID/INVALID/UNCERTAIN"}}
+
+---
+
+**Reported vulnerability:**
+{finding}
+
+**Code from {filepath}:**
+```{fence}
+{code}
+```\
+"""
+
+USER_PROMPT_TEMPLATE = """\
+Analyze the following {language_name} source file for zero-day vulnerabilities.
+
+File: {filepath}
+
+```{fence}
+{code}
+```
+
+Provide a detailed security analysis.\
+"""
+
+C_FEWSHOT_USER = """\
+Analyze the following C/C++ source file for zero-day vulnerabilities.
 
 File: example/net/parser.c
 
@@ -169,143 +452,351 @@ int process_attr(struct attr_value *av) {
 Provide a detailed security analysis.\
 """
 
-FEWSHOT_EXAMPLE_ASSISTANT = """\
+C_FEWSHOT_ASSISTANT = """\
 `parse_packet`: `data` and `len` come from the network. Copies `len` \
-bytes into 64-byte stack buffer with no bounds check — overflow if \
-`len > 64`. `handle_request`: `lookup_session()` can return NULL but \
+bytes into a 64-byte stack buffer with no bounds check, so `len > 64` \
+overflows. `handle_request`: `lookup_session()` can return NULL and the \
 result is dereferenced. `log_debug`: safe, already checks NULL. \
-`process_attr`: accesses union member without checking type tag.
+`process_attr`: accesses a union member without checking the type tag.
 
 ```json
 [
-  {{"severity": "critical", "title": "Stack buffer overflow via unchecked len", "function": "parse_packet()", "description": "memcpy copies attacker-controlled len bytes into 64-byte stack buffer without bounds check"}},
-  {{"severity": "high", "title": "NULL deref on failed session lookup", "function": "handle_request()", "description": "lookup_session() may return NULL for unknown session_id but result is dereferenced unconditionally"}},
-  {{"severity": "high", "title": "Type confusion on union access", "function": "process_attr()", "description": "Accesses av->value.str_val without checking av->type. If av is from parsed input, wrong union member is read"}}
+  {"severity": "critical", "title": "Stack buffer overflow via unchecked len", "function": "parse_packet()", "description": "memcpy copies attacker-controlled len bytes into a 64-byte stack buffer without a bounds check"},
+  {"severity": "high", "title": "NULL deref on failed session lookup", "function": "handle_request()", "description": "lookup_session() may return NULL for unknown session_id but the result is dereferenced unconditionally"},
+  {"severity": "high", "title": "Type confusion on union access", "function": "process_attr()", "description": "Accesses av->value.str_val without checking av->type. If av is from parsed input, the wrong union member is read"}
 ]
 ```\
 """
 
-CONTEXT_GEN_PROMPT = """\
-You are preparing a security briefing for a vulnerability researcher. \
-Write a concise (~250 word) context briefing covering:
+TS_FEWSHOT_USER = """\
+Analyze the following TypeScript/JavaScript source file for zero-day vulnerabilities.
 
-1. What this code does and where it sits in the project
-2. How untrusted input reaches this code (network, file, API?)
-3. Which variables/fields carry attacker-controlled data — name them, \
-   trace the data flow from entry point to usage
-4. All fixed-size buffers and size constants — name them with sizes. \
-   If sizes are defined by named constants (macros, #defines), use \
-   GREP to find the actual numeric value. State the resolved value \
-   explicitly, e.g. "buf[EVP_MAX_MD_SIZE] where EVP_MAX_MD_SIZE=64"
-5. Dangerous data flows: attacker-controlled data → fixed-size buffer. \
-   Name source, destination, function, and the numeric buffer size \
-   for each
-6. Parameters that could be NULL from malformed input but are \
-   dereferenced without checks
-7. Tagged unions or variant types accessed without type-tag validation. \
-   Note whether the code checks the type tag before accessing \
-   type-specific union members
-8. Which functions are public API vs static helpers (and whether \
-   static helpers are called safely)
-9. What bug classes are most likely given this code's structure
+File: example/server/routes.ts
 
-Name actual variables and constants from the code. Do not find \
-vulnerabilities — just provide context. Use your training knowledge \
-of this project where helpful.
+```ts
+app.get("/download", async (req, res) => {
+  const name = req.query.name as string;
+  res.sendFile(path.join(DATA_DIR, name));
+});
 
-GREP TOOL: You can search the codebase by including GREP: pattern \
-in your response. Use this to look up the actual values of constants, \
-find callers of functions, or check how data flows between files. \
-The results will be appended to your briefing.\
-"""
+app.get("/avatar", async (req, res) => {
+  const url = req.query.url as string;
+  const r = await fetch(url);
+  res.send(await r.text());
+});
 
-TRIAGE_PROMPT_TEMPLATE = """\
-A vulnerability scanner flagged this in {project_name}. Is it real?
-
-Be skeptical — most scanner findings are false positives.
-
-RULES:
-- VALID: the bug is real AND an external attacker can trigger it to \
-  cause meaningful harm (crash, code execution, data corruption, auth \
-  bypass). The attacker must control the input that triggers the bug.
-- INVALID: the bug pattern does not exist, OR it is not attacker-reachable \
-  (only trusted internal callers), OR a concrete defense prevents it, \
-  OR it is a code quality issue not a security vulnerability (e.g. \
-  data race on diagnostic state, missing NULL check on internal-only \
-  API, undefined behavior only in debug builds).
-- UNCERTAIN: only if you genuinely cannot determine.
-
-ABSENCE OF DEFENSE: If the bug pattern clearly exists, the input \
-comes from an untrusted source, and you searched for a defense but \
-did not find one, lean toward VALID rather than UNCERTAIN. Not \
-having verified every upstream caller is not a reason to mark \
-UNCERTAIN — only cite a defense if you can name the specific \
-function and show it is sufficient.
-
-CRITICAL: When you cite any defense — a size limit, a NULL check, a \
-type validation — you must verify it actually works. Look up the \
-actual numeric values. Do the arithmetic. Show your work. "There \
-exists a bound" is NOT the same as "the bound is sufficient." Never \
-skip the verification step.
-
-FOLLOW CONSTANTS: When you encounter a named constant in code or \
-grep results, you MUST \
-grep for its #define to find the actual numeric value. A constant \
-name is not a verified bound — only its resolved value is. If a \
-function receives a size parameter, grep for its callers to see what \
-value they pass.
-
-IMPORTANT: If your own analysis leads to a conclusion, do not then \
-contradict it in the same response. If you verify a defense and find \
-it insufficient, that is your answer — do not keep searching for \
-reasons to change your mind. Trust your own reasoning.
-
-If you believe a defense exists that you haven't verified, you must \
-either name the specific function/line that implements it or grep \
-for it. Vague references to "assumptions in this codebase" or \
-"other code probably handles this" are not valid defenses. If you \
-cannot point to it or find it, it does not exist.
-
-GREP TOOL: Include a grep pattern in the JSON to search the codebase. \
-Use this to look up values, check implementations, and verify defenses. \
-GREP PATTERNS: Use function/variable/constant names as patterns, e.g. \
-"MAX_BUF_SIZE", "parse_input(", "buflen". Do NOT prefix patterns with \
-file paths like "src/foo/bar.c:symbol" — that searches for the literal \
-string inside files and will return nothing. To find callers of a \
-function, grep for its name. To resolve a constant, grep for its name \
-to find its #define.
-
-Use your knowledge of {project_name} for intuition, but verify \
-specifics via grep. Do not invent defenses.
-
-Respond ONLY with JSON:
-{{"reasoning": "Analyze the evidence. State your conclusion clearly.", \
-"crux": "the single key fact the verdict depends on", \
-"grep": "search_pattern to verify the crux", \
-"verdict": "VALID/INVALID/UNCERTAIN"}}
-
----
-
-**Reported vulnerability:**
-{finding}
-
-**Code from {filepath}:**
-```c
-{code}
-```\
-"""
-
-USER_PROMPT_TEMPLATE = """\
-Analyze the following source file for zero-day vulnerabilities.
-
-File: {filepath}
-
-```c
-{code}
+app.post("/users/:id", requireAuth, async (req, res) => {
+  await db.user.update({
+    where: { id: req.params.id },
+    data: req.body,
+  });
+  res.send("ok");
+});
 ```
 
 Provide a detailed security analysis.\
 """
+
+TS_FEWSHOT_ASSISTANT = """\
+`GET /download`: `req.query.name` controls the path passed to `sendFile`; \
+there is no resolve-and-prefix check keeping the result under `DATA_DIR`. \
+`GET /avatar`: `req.query.url` is fetched directly, which can reach internal \
+services. `POST /users/:id`: authentication exists, but no ownership check \
+links the authenticated user to `req.params.id`, and the full request body \
+is passed into the ORM.
+
+```json
+[
+  {"severity": "high", "title": "Path traversal in download endpoint", "function": "GET /download", "description": "User-controlled name is joined with DATA_DIR and sent with sendFile without resolving and checking that the final path stays under DATA_DIR."},
+  {"severity": "high", "title": "SSRF via attacker-controlled fetch URL", "function": "GET /avatar", "description": "The endpoint fetches req.query.url directly, allowing requests to internal services unless an allowlist or URL validation exists."},
+  {"severity": "high", "title": "IDOR/mass assignment in user update", "function": "POST /users/:id", "description": "Authenticated users can update arbitrary user ids from params, and req.body is passed directly into the ORM without field allowlisting."}
+]
+```\
+"""
+
+PY_FEWSHOT_USER = """\
+Analyze the following Python source file for zero-day vulnerabilities.
+
+File: example/app/views.py
+
+```python
+@app.route("/run")
+def run_job():
+    name = request.args["name"]
+    subprocess.check_output(f"backup --name {name}", shell=True)
+    return "ok"
+
+@app.route("/import", methods=["POST"])
+def import_config():
+    cfg = yaml.load(request.data, Loader=yaml.Loader)
+    return jsonify(cfg)
+
+@app.route("/files/<path:name>")
+def download(name):
+    return send_file(os.path.join(DATA_DIR, name))
+
+@app.post("/users/<user_id>")
+@login_required
+def update_user(user_id):
+    db.execute(f"update users set email='{request.json['email']}' where id='{user_id}'")
+    return "ok"
+```
+
+Provide a detailed security analysis.\
+"""
+
+PY_FEWSHOT_ASSISTANT = """\
+`run_job`: query string data reaches a shell command. `import_config`: \
+`yaml.load` with the unsafe loader parses attacker-controlled bytes. \
+`download`: path data is joined and served without a resolved-prefix check. \
+`update_user`: authentication exists, but ownership is not checked and raw \
+SQL is built from attacker-controlled fields.
+
+```json
+[
+  {"severity": "critical", "title": "Command injection through shell=True backup command", "function": "run_job()", "description": "request.args['name'] is interpolated into a shell command passed to subprocess.check_output(..., shell=True)."},
+  {"severity": "critical", "title": "Unsafe YAML deserialization of request body", "function": "import_config()", "description": "The route passes attacker-controlled request.data to yaml.load with yaml.Loader, which can construct unsafe Python objects."},
+  {"severity": "high", "title": "Path traversal in file download", "function": "download()", "description": "The route joins attacker-controlled path data with DATA_DIR and serves it without resolving and verifying that the final path stays under DATA_DIR."},
+  {"severity": "high", "title": "SQL injection and missing ownership check in user update", "function": "update_user()", "description": "The handler builds SQL with f-strings from request data and user_id, and login_required alone does not prove the caller owns the target user_id."}
+]
+```\
+"""
+
+SH_FEWSHOT_USER = """\
+Analyze the following Shell source file for zero-day vulnerabilities.
+
+File: example/scripts/deploy.sh
+
+```bash
+#!/usr/bin/env bash
+set -e
+branch="$1"
+pkg="$2"
+tmp="/tmp/deploy-$branch"
+
+eval "git checkout $branch"
+tar xf "$pkg" -C /opt/app
+rm -rf $tmp
+curl "$INSTALL_URL" | sh
+```
+
+Provide a detailed security analysis.\
+"""
+
+SH_FEWSHOT_ASSISTANT = """\
+`branch` is argv-controlled and reaches `eval`, so shell metacharacters \
+execute in the script context. `pkg` may be attacker-controlled and is \
+extracted without traversal defenses. `tmp` includes attacker-controlled \
+branch data and is later expanded unquoted in `rm -rf`. `curl | sh` runs \
+network data as code if `INSTALL_URL` is not trusted.
+
+```json
+[
+  {"severity": "critical", "title": "Command injection through eval on branch argument", "function": "deploy.sh", "description": "The first argv value is interpolated into eval \"git checkout $branch\", allowing shell metacharacters to run in the deployment script context."},
+  {"severity": "high", "title": "Unsafe archive extraction into application directory", "function": "deploy.sh", "description": "The script extracts an attacker-supplied archive into /opt/app without checking for path traversal or unsafe ownership/permission metadata."},
+  {"severity": "high", "title": "Unquoted attacker-controlled path reaches rm -rf", "function": "deploy.sh", "description": "tmp includes the branch argument and is expanded unquoted in rm -rf, enabling word splitting, globbing, and option/path confusion in a destructive command."},
+  {"severity": "medium", "title": "Network script execution through curl pipe", "function": "deploy.sh", "description": "curl \"$INSTALL_URL\" | sh executes remote content in the script context unless INSTALL_URL is a trusted, pinned source."}
+]
+```\
+"""
+
+CI_FEWSHOT_USER = """\
+Analyze the following CI/CD source file for zero-day vulnerabilities.
+
+File: .github/workflows/deploy.yml
+
+```yaml
+name: deploy
+on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install
+      - run: echo "${{ github.event.pull_request.title }}" | sh
+      - run: ./deploy.sh
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+```
+
+Provide a detailed security analysis.\
+"""
+
+CI_FEWSHOT_ASSISTANT = """\
+This workflow runs on `pull_request_target`, has write-all permissions and \
+secrets, checks out untrusted PR code, then executes commands. The PR title \
+also reaches `sh`. That crosses the untrusted PR to privileged-token boundary.
+
+```json
+[
+  {"severity": "critical", "title": "Privileged pull_request_target workflow executes untrusted PR code", "function": "deploy job", "description": "The workflow runs with pull_request_target permissions and secrets, checks out github.event.pull_request.head.sha, then runs npm install and deploy.sh from untrusted code."},
+  {"severity": "critical", "title": "Shell injection from pull request title", "function": "deploy job", "description": "github.event.pull_request.title is attacker-controlled and is piped to sh in a privileged workflow context."}
+]
+```\
+"""
+
+GENERIC_FEWSHOT_USER = TS_FEWSHOT_USER
+GENERIC_FEWSHOT_ASSISTANT = TS_FEWSHOT_ASSISTANT
+
+C_TRIAGE_RULES = """\
+- INVALID if the crash is an internal-only misuse with no untrusted caller.
+- INVALID if a caller-provided size is concretely bounded below the destination size.
+- VALID if attacker-controlled data reaches a memory-corrupting operation, unsafe parser state, or privileged file/command sink without a verified sufficient defense.
+- If claiming a bound exists, show the numeric value and the arithmetic.\
+"""
+
+MANAGED_TRIAGE_RULES = """\
+- INVALID if the issue is only a type error, ordinary exception, or crash with no meaningful security impact.
+- INVALID if input is already constrained by a named schema/serializer/validator and the validator is sufficient; name the schema/function and allowed pattern.
+- INVALID if the route is admin-only and the reported impact is only against the admin's own data, unless privilege escalation or tenant escape exists.
+- VALID for authz bugs only when a lower-privileged user can affect another user, tenant, or resource.
+- If claiming path traversal is prevented, show the normalize/resolve check and prefix comparison.
+- If claiming command injection is prevented, show list-argv usage or safe quoting; do not assume.
+- If claiming authz exists, show the ownership/tenant check, not just authentication.\
+"""
+
+SHELL_TRIAGE_RULES = """\
+- INVALID if the variable is constant, internal-only, or not attacker-controlled.
+- INVALID if the variable is always safely quoted and passed after -- where option injection matters.
+- VALID if untrusted input reaches eval, sh -c, backticks, unquoted command position, destructive file operation, or a privileged CI/deploy context.
+- If claiming quoting is sufficient, show the exact expansion and command invocation.\
+"""
+
+CI_TRIAGE_RULES = """\
+- INVALID if the workflow only runs on trusted branches or trusted maintainers with no untrusted data crossing into a privileged sink.
+- VALID if untrusted PR/input/artifact/cache data reaches shell execution, deployment, secrets, write tokens, or privileged checkout.
+- For pull_request_target, verify whether untrusted code or metadata is checked out or executed before declaring it safe.
+- If claiming permissions are safe, show the effective permissions and secret exposure boundary.\
+"""
+
+GENERIC_TRIAGE_RULES = """\
+- INVALID if the finding is generic hardening advice without attacker reachability and concrete impact.
+- INVALID if a named validator, sanitizer, wrapper, or authorization check is verified sufficient.
+- VALID when untrusted input reaches a sensitive sink across a security boundary and no concrete defense is found.
+- Verify defenses by naming the exact function, schema, setting, or wrapper.\
+"""
+
+LANGUAGE_PROFILES = {
+    "c": {
+        "id": "c",
+        "name": "C/C++",
+        "extensions": [".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx"],
+        "filenames": [],
+        "fence": "c",
+        "grep_globs": ["*.c", "*.h", "*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hxx"],
+        "focus": C_SECURITY_FOCUS,
+        "context_checklist": C_CONTEXT_CHECKLIST,
+        "triage_rules": C_TRIAGE_RULES,
+        "fewshot_user": C_FEWSHOT_USER,
+        "fewshot_assistant": C_FEWSHOT_ASSISTANT,
+    },
+    "ts": {
+        "id": "ts",
+        "name": "TypeScript/JavaScript",
+        "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
+        "filenames": [],
+        "fence": "ts",
+        "grep_globs": ["*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.mts", "*.cts"],
+        "focus": TS_JS_SECURITY_FOCUS,
+        "context_checklist": TS_JS_CONTEXT_CHECKLIST,
+        "triage_rules": MANAGED_TRIAGE_RULES,
+        "fewshot_user": TS_FEWSHOT_USER,
+        "fewshot_assistant": TS_FEWSHOT_ASSISTANT,
+    },
+    "py": {
+        "id": "py",
+        "name": "Python",
+        "extensions": [".py", ".pyi"],
+        "filenames": [],
+        "fence": "python",
+        "grep_globs": ["*.py", "*.pyi"],
+        "focus": PY_SECURITY_FOCUS,
+        "context_checklist": PY_CONTEXT_CHECKLIST,
+        "triage_rules": MANAGED_TRIAGE_RULES,
+        "fewshot_user": PY_FEWSHOT_USER,
+        "fewshot_assistant": PY_FEWSHOT_ASSISTANT,
+    },
+    "sh": {
+        "id": "sh",
+        "name": "Shell",
+        "extensions": [".sh", ".bash", ".zsh"],
+        "filenames": [],
+        "fence": "bash",
+        "grep_globs": ["*.sh", "*.bash", "*.zsh"],
+        "focus": SH_SECURITY_FOCUS,
+        "context_checklist": SH_CONTEXT_CHECKLIST,
+        "triage_rules": SHELL_TRIAGE_RULES,
+        "fewshot_user": SH_FEWSHOT_USER,
+        "fewshot_assistant": SH_FEWSHOT_ASSISTANT,
+    },
+    "ci": {
+        "id": "ci",
+        "name": "CI/CD YAML",
+        "extensions": [".yml", ".yaml"],
+        "filenames": [],
+        "fence": "yaml",
+        "grep_globs": ["*.yml", "*.yaml"],
+        "focus": CI_SECURITY_FOCUS,
+        "context_checklist": CI_CONTEXT_CHECKLIST,
+        "triage_rules": CI_TRIAGE_RULES,
+        "fewshot_user": CI_FEWSHOT_USER,
+        "fewshot_assistant": CI_FEWSHOT_ASSISTANT,
+    },
+    "docker": {
+        "id": "docker",
+        "name": "Dockerfile/Containerfile",
+        "extensions": [".dockerfile"],
+        "filenames": ["Dockerfile", "Containerfile"],
+        "fence": "dockerfile",
+        "grep_globs": [
+            "Dockerfile", "**/Dockerfile", "Containerfile", "**/Containerfile",
+            "*.dockerfile", "*.Dockerfile",
+        ],
+        "focus": CI_SECURITY_FOCUS,
+        "context_checklist": CI_CONTEXT_CHECKLIST,
+        "triage_rules": CI_TRIAGE_RULES,
+        "fewshot_user": CI_FEWSHOT_USER,
+        "fewshot_assistant": CI_FEWSHOT_ASSISTANT,
+    },
+    "generic": {
+        "id": "generic",
+        "name": "source",
+        "extensions": [],
+        "filenames": [],
+        "fence": "",
+        "grep_globs": ["*"],
+        "focus": GENERIC_SECURITY_FOCUS,
+        "context_checklist": GENERIC_CONTEXT_CHECKLIST,
+        "triage_rules": GENERIC_TRIAGE_RULES,
+        "fewshot_user": GENERIC_FEWSHOT_USER,
+        "fewshot_assistant": GENERIC_FEWSHOT_ASSISTANT,
+    },
+}
+
+_PROFILE_EXTENSIONS = {
+    ext: profile
+    for profile in LANGUAGE_PROFILES.values()
+    for ext in profile.get("extensions", [])
+}
+_PROFILE_FILENAMES = {
+    name.lower(): profile
+    for profile in LANGUAGE_PROFILES.values()
+    for name in profile.get("filenames", [])
+}
+
+
+def language_profile_for_path(filepath):
+    """Infer the best language/security profile from a path."""
+    base = os.path.basename(filepath).lower()
+    if base in _PROFILE_FILENAMES:
+        return _PROFILE_FILENAMES[base]
+
+    ext = os.path.splitext(filepath)[1].lower()
+    return _PROFILE_EXTENSIONS.get(ext, LANGUAGE_PROFILES["generic"])
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -1158,7 +1649,21 @@ def _under_default_skip_dir(filepath, scan_base):
     return False
 
 
-def discover_files(path, extensions, max_chars, respect_gitignore=True):
+def _matches_requested_file_type(filepath, extensions, filenames=None):
+    """True when a file should be scanned based on extension or basename."""
+    if not extensions and not filenames:
+        return True
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if extensions and ext in extensions:
+        return True
+
+    basename = os.path.basename(filepath)
+    lower_filenames = {name.lower() for name in (filenames or set())}
+    return basename.lower() in lower_filenames
+
+
+def discover_files(path, extensions, max_chars, respect_gitignore=True, filenames=None):
     """Walk a path (file or dir) and return (scannable, skipped) lists."""
     scannable = []
     skipped = []
@@ -1200,8 +1705,7 @@ def discover_files(path, extensions, max_chars, respect_gitignore=True):
             skipped.append((filepath, "symlink"))
             continue
 
-        ext = os.path.splitext(filepath)[1].lower()
-        if extensions and ext not in extensions:
+        if not _matches_requested_file_type(filepath, extensions, filenames):
             skipped.append((filepath, "extension"))
             continue
 
@@ -1236,29 +1740,238 @@ def discover_files(path, extensions, max_chars, respect_gitignore=True):
 
     return scannable, skipped
 
+
+def _read_text_prefix(path, max_chars=8000):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(max_chars)
+    except OSError:
+        return ""
+
+
+def _first_existing(repo_dir, names):
+    for name in names:
+        path = os.path.join(repo_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _summarize_package_json(repo_dir):
+    path = _first_existing(repo_dir, ["package.json"])
+    if not path:
+        return None
+
+    try:
+        data = json.loads(_read_text_prefix(path, max_chars=80_000))
+    except json.JSONDecodeError:
+        return "package.json present but could not be parsed"
+
+    scripts = data.get("scripts", {})
+    deps = {}
+    for key in ("dependencies", "devDependencies"):
+        deps.update(data.get(key, {}) or {})
+
+    frameworks = [
+        name for name in (
+            "next", "express", "@nestjs/core", "@remix-run/node", "@trpc/server",
+            "fastify", "koa", "hapi", "electron", "prisma", "typeorm",
+            "sequelize", "drizzle-orm", "mongoose", "zod", "joi", "yup",
+            "class-validator",
+        )
+        if name in deps
+    ]
+    shown_scripts = ", ".join(list(scripts.keys())[:12]) or "none"
+    shown_deps = ", ".join(frameworks[:20]) or "none detected"
+    return f"package.json: scripts={shown_scripts}; notable deps={shown_deps}"
+
+
+def _summarize_python_manifests(repo_dir):
+    lines = []
+    pyproject = _first_existing(repo_dir, ["pyproject.toml"])
+    if pyproject:
+        text = _read_text_prefix(pyproject, max_chars=20_000)
+        interesting = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if (
+                stripped.startswith("[project]")
+                or stripped.startswith("[tool.poetry")
+                or stripped.startswith("[tool.uv")
+                or stripped.startswith("dependencies")
+                or stripped.startswith("requires-python")
+                or any(name in stripped.lower() for name in (
+                    "django", "flask", "fastapi", "celery", "pydantic",
+                    "sqlalchemy", "requests", "httpx",
+                ))
+            ):
+                interesting.append(stripped)
+            if len(interesting) >= 12:
+                break
+        lines.append("pyproject.toml: " + "; ".join(interesting[:12]))
+
+    req = _first_existing(repo_dir, ["requirements.txt", "requirements-dev.txt"])
+    if req:
+        pkgs = []
+        for line in _read_text_prefix(req, max_chars=20_000).splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                pkgs.append(re.split(r'[<=>\[]', stripped, 1)[0])
+            if len(pkgs) >= 20:
+                break
+        lines.append("requirements: " + ", ".join(pkgs))
+
+    return "\n".join(lines) if lines else None
+
+
+def _summarize_routes_and_settings(repo_dir):
+    facts = []
+    route_markers = []
+    settings_markers = []
+    for root, dirnames, filenames in os.walk(repo_dir):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in DEFAULT_SKIP_DIRS and not d.endswith(".egg-info")
+        ]
+        rel_root = os.path.relpath(root, repo_dir)
+        if rel_root.count(os.sep) > 4:
+            dirnames[:] = []
+            continue
+
+        for filename in filenames:
+            rel = os.path.normpath(os.path.join(rel_root, filename))
+            rel = filename if rel == "." else rel
+            lowered = rel.lower()
+            if (
+                "pages/api" in lowered
+                or "app/api" in lowered
+                or lowered.endswith("routes.ts")
+                or lowered.endswith("routes.js")
+                or lowered.endswith("urls.py")
+                or lowered.endswith("router.py")
+                or lowered.endswith("views.py")
+            ):
+                route_markers.append(rel)
+            if lowered.endswith("settings.py") or lowered.endswith("next.config.js") or lowered.endswith("next.config.ts"):
+                settings_markers.append(rel)
+
+        if len(route_markers) >= 20 and len(settings_markers) >= 8:
+            break
+
+    if route_markers:
+        facts.append("route files: " + ", ".join(route_markers[:20]))
+    if settings_markers:
+        facts.append("settings/config files: " + ", ".join(settings_markers[:8]))
+    return "\n".join(facts) if facts else None
+
+
+def _summarize_ci_files(repo_dir):
+    facts = []
+    workflows_dir = os.path.join(repo_dir, ".github", "workflows")
+    if os.path.isdir(workflows_dir):
+        workflow_summaries = []
+        for name in sorted(os.listdir(workflows_dir))[:12]:
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            path = os.path.join(workflows_dir, name)
+            text = _read_text_prefix(path, max_chars=12000)
+            triggers = []
+            permissions = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("on:", "pull_request", "pull_request_target", "workflow_dispatch")):
+                    triggers.append(stripped)
+                if stripped.startswith(("permissions:", "contents:", "id-token:", "actions:", "checks:")):
+                    permissions.append(stripped)
+                if len(triggers) >= 6 and len(permissions) >= 6:
+                    break
+            detail = []
+            if triggers:
+                detail.append("triggers=" + ", ".join(triggers[:6]))
+            if permissions:
+                detail.append("permissions=" + ", ".join(permissions[:6]))
+            workflow_summaries.append(f"{name} ({'; '.join(detail) or 'no trigger summary'})")
+        if workflow_summaries:
+            facts.append("workflows: " + "; ".join(workflow_summaries))
+
+    docker_files = []
+    for root, dirnames, filenames in os.walk(repo_dir):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in DEFAULT_SKIP_DIRS and not d.endswith(".egg-info")
+        ]
+        for filename in filenames:
+            if filename in DEFAULT_FILENAMES or filename.lower().endswith(".dockerfile"):
+                docker_files.append(os.path.relpath(os.path.join(root, filename), repo_dir))
+        if len(docker_files) >= 12:
+            break
+    if docker_files:
+        facts.append("docker/container files: " + ", ".join(docker_files[:12]))
+    return "\n".join(facts) if facts else None
+
+
+def collect_repo_manifest_context(repo_dir, max_chars=2500):
+    """Collect compact repo-level facts relevant to managed-language scans."""
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return "(repo context unavailable)"
+
+    sections = []
+    for summarizer in (
+        _summarize_package_json,
+        _summarize_python_manifests,
+        _summarize_routes_and_settings,
+        _summarize_ci_files,
+    ):
+        summary = summarizer(repo_dir)
+        if summary:
+            sections.append(summary)
+
+    if not sections:
+        return "(no manifest/framework facts detected)"
+
+    text = "\n".join(f"- {section}" for section in sections)
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n- (repo context truncated)"
+    return text
+
 # ---------------------------------------------------------------------------
 # Core scan logic (per-file, runs in thread)
 # ---------------------------------------------------------------------------
 
-def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None):
+def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None,
+                     profile=None, repo_context=None):
     """Run the two-stage scan on a single file. Returns result dict."""
+    profile = profile or language_profile_for_path(filepath)
+    repo_context = repo_context or "(repo context unavailable)"
     result = {
         "file": filepath,
         "display_name": display_name,
         "model": model,
+        "language_profile": profile["id"],
+        "language_name": profile["name"],
     }
 
     try:
         # Stage 1: generate context (with optional grep)
+        context_prompt = CONTEXT_GEN_PROMPT_TEMPLATE.format(
+            language_name=profile["name"],
+            context_checklist=profile["context_checklist"],
+            repo_context=repo_context[:2500],
+        )
         ctx_messages = [
-            {"role": "system", "content": CONTEXT_GEN_PROMPT},
-            {"role": "user", "content": f"File: {display_name}\n\n```\n{code}\n```"},
+            {"role": "system", "content": context_prompt},
+            {"role": "user", "content": (
+                f"File: {display_name}\n\n"
+                f"```{profile['fence']}\n{code}\n```"
+            )},
         ]
         context, ctx_usage, ctx_elapsed = call_llm(model, ctx_messages, keys)
 
         # Execute any grep requests from context generation
         if repo_dir:
-            ctx_greps = execute_grep_requests(context, repo_dir)
+            ctx_greps = execute_grep_requests(
+                context, repo_dir, profile["grep_globs"]
+            )
             if ctx_greps:
                 context += f"\n\n[GREP RESULTS from codebase]:\n{ctx_greps}"
 
@@ -1267,13 +1980,21 @@ def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None):
         result["context_elapsed"] = round(ctx_elapsed, 1)
 
         # Stage 2: vulnerability scan (with few-shot example)
+        scan_system_prompt = SCAN_SYSTEM_PROMPT_TEMPLATE.format(
+            language_name=profile["name"],
+            focus=profile["focus"],
+        )
         scan_messages = [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT + "\n\n"
+            {"role": "system", "content": scan_system_prompt + "\n\n"
              "Security context for the file being analyzed:\n" + context},
-            {"role": "user", "content": FEWSHOT_EXAMPLE_USER},
-            {"role": "assistant", "content": FEWSHOT_EXAMPLE_ASSISTANT},
+            {"role": "user", "content": profile["fewshot_user"]},
+            {"role": "assistant", "content": profile["fewshot_assistant"]},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(
-                filepath=display_name, code=code)},
+                language_name=profile["name"],
+                filepath=display_name,
+                fence=profile["fence"],
+                code=code,
+            )},
         ]
         report, scan_usage, scan_elapsed = call_llm(model, scan_messages, keys)
         result["report"] = report
@@ -1345,11 +2066,12 @@ def init_grep_index(repo_dir):
         _csearch_path = None
 
 
-def execute_grep_requests(response_text, repo_dir):
+def execute_grep_requests(response_text, repo_dir, grep_globs=None):
     """Parse grep requests from triage response, execute them, return results.
     Uses csearch if indexed, falls back to ripgrep."""
     if not repo_dir or not os.path.isdir(repo_dir):
         return None
+    grep_globs = grep_globs or ["*"]
 
     requests = []
 
@@ -1400,6 +2122,53 @@ def execute_grep_requests(response_text, repo_dir):
                 return ident
         return None
 
+    def _path_matches_grep_globs(path):
+        """Filter a relative file path by the active language profile globs."""
+        path = path.replace("\\", "/").lstrip("./")
+        basename = os.path.basename(path)
+        return any(
+            fnmatch.fnmatch(path, glob)
+            or fnmatch.fnmatch(basename, glob)
+            for glob in grep_globs
+        )
+
+    def _matches_grep_globs(line):
+        """Filter a grep output line by the matched file path."""
+        return _path_matches_grep_globs(line.split(":", 1)[0])
+
+    def _python_grep(pattern, repo_dir, fixed=True):
+        """Portable fallback when csearch/rg are unavailable."""
+        try:
+            regex = None if fixed else re.compile(pattern)
+        except re.error:
+            return ""
+
+        matches = []
+        for root, dirnames, filenames in os.walk(repo_dir):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in DEFAULT_SKIP_DIRS and not d.endswith(".egg-info")
+            ]
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, repo_dir)
+                if not _path_matches_grep_globs(rel_path):
+                    continue
+                try:
+                    if os.path.getsize(full_path) > DEFAULT_MAX_CHARS:
+                        continue
+                    with open(full_path, encoding="utf-8", errors="replace") as f:
+                        for line_no, line in enumerate(f, 1):
+                            haystack = line.rstrip("\n")
+                            matched = pattern in haystack if fixed else regex.search(haystack)
+                            if matched:
+                                matches.append(f"{rel_path}:{line_no}:{haystack}")
+                                if len(matches) >= MAX_GREP_LINES * 3:
+                                    return "\n".join(matches)
+                except OSError:
+                    continue
+        return "\n".join(matches)
+
     # Expand compound patterns and clean up
     expanded = []
     for raw in requests[:MAX_GREP_REQUESTS]:
@@ -1441,21 +2210,29 @@ def execute_grep_requests(response_text, repo_dir):
                 raw = proc.stdout.strip()
                 if raw:
                     raw = raw.replace(repo_dir.rstrip("/") + "/", "")
-                    lines_filtered = [l for l in raw.splitlines()
-                                      if re.search(r'\.[ch]:', l)]
+                    lines_filtered = [
+                        l for l in raw.splitlines()
+                        if _matches_grep_globs(l)
+                    ]
                     return "\n".join(lines_filtered)
                 return ""
             else:
-                if not _rg_path:
-                    return ""
                 flags = ["--fixed-strings"] if fixed else []
-                proc = subprocess.run(
-                    [_rg_path, "--no-heading", "-n"] + flags +
-                    ["-g", "*.c", "-g", "*.h", pattern],
-                    capture_output=True, text=True, timeout=60,
-                    cwd=repo_dir, errors="replace",
-                )
-                return proc.stdout.strip()
+                if _rg_path:
+                    glob_args = ["--hidden"]
+                    for skip_dir in sorted(DEFAULT_SKIP_DIRS):
+                        glob_args.extend(["-g", f"!{skip_dir}/**"])
+                        glob_args.extend(["-g", f"!**/{skip_dir}/**"])
+                    for glob in grep_globs:
+                        glob_args.extend(["-g", glob])
+                    proc = subprocess.run(
+                        [_rg_path, "--no-heading", "-n"] + flags +
+                        glob_args + ["--", pattern],
+                        capture_output=True, text=True, timeout=60,
+                        cwd=repo_dir, errors="replace",
+                    )
+                    return proc.stdout.strip()
+                return _python_grep(pattern, repo_dir, fixed=fixed)
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return ""
 
@@ -1477,10 +2254,15 @@ def execute_grep_requests(response_text, repo_dir):
                         pattern = f"{pattern} (simplified to: {simplified})"
 
             all_lines = raw.splitlines() if raw else []
-            # Prioritize #define and .h lines (definitions) over usage sites
+            # Prioritize likely definitions/config declarations over usage sites.
             def _line_priority(l):
-                if '#define' in l: return 0
-                if '.h:' in l: return 1
+                definition_markers = (
+                    '#define', 'function ', 'def ', 'class ', 'const ',
+                    'export ', 'permissions:', 'on:', 'schema',
+                    'validator', 'middleware',
+                )
+                if any(marker in l for marker in definition_markers): return 0
+                if any(suffix in l for suffix in ('.h:', '.hpp:', '.py:', '.ts:')): return 1
                 return 2
             all_lines.sort(key=_line_priority)
             lines = all_lines[:MAX_GREP_LINES]
@@ -1532,12 +2314,16 @@ def _condense_prior_greps(reasoning_text, max_lines_per_pattern=3):
 
 def triage_finding(finding_title, finding_text, code, filepath,
                    project_name, model, keys, prior_reasoning=None,
-                   repo_dir=None, reasoning_effort=None, file_context=None):
+                   repo_dir=None, reasoning_effort=None, file_context=None,
+                   profile=None):
     """Stage 3: Skeptical triage of a single finding. Returns verdict dict."""
+    profile = profile or language_profile_for_path(filepath)
     prompt = TRIAGE_PROMPT_TEMPLATE.format(
         project_name=project_name,
         finding=finding_text,
         filepath=filepath,
+        fence=profile["fence"],
+        triage_rules=profile["triage_rules"],
         code=code,
     )
 
@@ -1572,12 +2358,14 @@ def triage_finding(finding_title, finding_text, code, filepath,
          "(2) Can an attacker reach it through untrusted input? Trace "
          "the data flow backward from the bug to its origin. "
          "(3) If a defense is cited, is it actually sufficient? If you "
-         "find a numeric constant, grep for its value before concluding. "
+         "find a named constant, schema, middleware, wrapper, setting, "
+         "or sanitizer, grep for its definition before concluding. "
          "(4) Even if the bug is real, is it security-relevant? A data "
-         "race on diagnostic state, a missing NULL check on an internal "
-         "API that only trusted callers use, or undefined behavior only "
-         "in debug builds are code quality issues, NOT security "
-         "vulnerabilities — mark these INVALID. "
+         "race on diagnostic state, ordinary exception, missing NULL "
+         "check on an internal API, or undefined behavior only in debug "
+         "builds is a code quality issue, NOT necessarily a security "
+         "vulnerability — mark it INVALID unless a concrete attacker "
+         "impact exists. "
          "Use GREP to verify. Do not guess."},
         {"role": "user", "content": prompt},
     ]
@@ -1681,6 +2469,7 @@ def run_scan(args):
         ext_set,
         args.max_chars,
         respect_gitignore=not args.include_ignored,
+        filenames=DEFAULT_FILENAMES,
     )
 
     if not scannable:
@@ -1736,6 +2525,8 @@ def run_scan(args):
         repo_dir = os.path.dirname(os.path.abspath(args.path))
     else:
         repo_dir = os.path.abspath(args.path)
+
+    repo_context = collect_repo_manifest_context(repo_dir)
 
     # Timestamp for output directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -1823,6 +2614,7 @@ def run_scan(args):
     def process_file(file_info):
         nonlocal completed
         filepath = file_info["filepath"]
+        profile = language_profile_for_path(filepath)
 
         with open(filepath) as f:
             code = f.read()
@@ -1836,6 +2628,8 @@ def run_scan(args):
                 filepath, code, display_name,
                 args.model, keys,
                 repo_dir=repo_dir,
+                profile=profile,
+                repo_context=repo_context,
             )
         finally:
             with print_lock:
@@ -1939,6 +2733,7 @@ def run_scan(args):
                                     prior_reasoning=prior,
                                     repo_dir=repo_dir,
                                     file_context=file_context,
+                                    profile=profile,
                                 )
                             except Exception as e:
                                 tv = {
@@ -1969,7 +2764,9 @@ def run_scan(args):
                         reasoning_text = tv.get("reasoning", "")
 
                         # Execute any GREP requests from this round
-                        grep_results = execute_grep_requests(reasoning_text, repo_dir)
+                        grep_results = execute_grep_requests(
+                            reasoning_text, repo_dir, profile["grep_globs"]
+                        )
                         if grep_results:
                             tv["grep_used"] = True
                             tv["grep_results"] = grep_results
@@ -2023,7 +2820,7 @@ def run_scan(args):
                             f"Verdicts so far: {verdicts_str} "
                             f"({n_valid} valid, {n_invalid} invalid)\n\n"
                             f"The relevant source code from {t_display}:\n"
-                            f"```c\n{t_code}\n```\n\n"
+                            f"```{profile['fence']}\n{t_code}\n```\n\n"
                             "Based on the code and evidence, is this a "
                             "real security vulnerability? Verify any "
                             "numeric values yourself from the code.\n\n"
@@ -2363,6 +3160,7 @@ def run_scan(args):
         "per_file": [
             {
                 "file": r["display_name"],
+                "language_profile": r.get("language_profile"),
                 "lines": r.get("lines", 0),
                 "severities": r["severities"],
                 "status": r["status"],
@@ -2386,11 +3184,12 @@ def run_scan(args):
         f.write(f"- **Respect gitignore**: {str(not args.include_ignored).lower()}\n")
         f.write(f"- **Files scanned**: {len(results)} ({total_lines:,} lines)\n")
         f.write(f"- **Wall time**: {wall_time:.0f}s\n\n")
-        f.write("| File | Lines | Critical | High | Medium | Low |\n")
-        f.write("|------|-------|----------|------|--------|-----|\n")
+        f.write("| File | Profile | Lines | Critical | High | Medium | Low |\n")
+        f.write("|------|---------|-------|----------|------|--------|-----|\n")
         for r in results:
             s = r["severities"]
-            f.write(f"| {r['display_name']} | {r.get('lines',0)} "
+            f.write(f"| {r['display_name']} | {r.get('language_profile', '')} "
+                    f"| {r.get('lines',0)} "
                     f"| {s.get('critical',0)} | {s.get('high',0)} "
                     f"| {s.get('medium',0)} | {s.get('low',0)} |\n")
 
