@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Aisle Inc.
 # SPDX-License-Identifier: Apache-2.0
+# Modified from AISLE's nano-analyzer prototype for local Codex CLI /
+# Claude Code backends and gitignore-aware scanning.
 """
 nano-analyzer: Minimal zero-day vulnerability scanner using LLMs.
+
+Adapted from AISLE's nano-analyzer for local CLI workflows.
 
 Two-stage pipeline:
   1. A cheap model generates security context about the file
   2. The scanner model uses that context to find vulnerabilities
 
 Usage:
-  nano-analyzer ./path/to/folder          # scan all source files recursively
-  nano-analyzer ./path/to/file.c          # scan a single file
-  nano-analyzer ./src --parallel 30       # control concurrency
-  nano-analyzer ./src --model gpt-5.4     # use a different scanner model
+  python3 scan.py ./path/to/folder        # scan source files recursively
+  python3 scan.py ./path/to/file.c        # scan a single file
+  python3 scan.py ./src --codex           # use Codex CLI, no API key
+  python3 scan.py ./src --claude          # use Claude Code, no API key
+  python3 scan.py ./src --backend api     # force OpenAI/OpenRouter API mode
+  python3 scan.py ./src --model gpt-5.4   # use a different API/Codex model
+  python3 scan.py ./src --claude-model sonnet --claude-effort high
+  python3 scan.py ./src --parallel 30     # control scan concurrency
+  python3 scan.py ./src --include-ignored # include gitignored files
 """
 
 import argparse
@@ -24,6 +33,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -37,17 +47,60 @@ from datetime import datetime
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+CODEX_MODEL_ALIASES = {"codex", "codex-cli"}
+CLAUDE_MODEL_ALIASES = {"claude", "claude-code", "sonnet", "opus", "haiku"}
+CODEX_JSON_OBJECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reasoning": {"type": "string"},
+        "crux": {"type": "string"},
+        "grep": {"type": "string"},
+        "verdict": {"type": "string"},
+    },
+    "required": ["reasoning", "crux", "grep", "verdict"],
+    "additionalProperties": False,
+}
 
 VERSION = "0.1"
 
 DEFAULT_MODEL = "gpt-5.4-nano"
 DEFAULT_PARALLEL = 50
+DEFAULT_TRIAGE_PARALLEL = 50
+DEFAULT_CODEX_PARALLEL = 4
+DEFAULT_CLAUDE_PARALLEL = 4
 DEFAULT_MAX_CHARS = 200_000
 DEFAULT_EXTENSIONS = {
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx",
     ".java", ".py", ".go", ".rs", ".js", ".ts", ".rb",
     ".swift", ".m", ".mm", ".cs", ".php", ".pl", ".sh",
     ".x",
+}
+DEFAULT_SKIP_DIRS = {
+    ".agents",
+    ".cache",
+    ".codex",
+    ".claude",
+    ".firebase",
+    ".git",
+    ".hg",
+    ".next",
+    ".nuxt",
+    ".pnpm-store",
+    ".svn",
+    ".svelte-kit",
+    ".turbo",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "bower_components",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+    "target",
+    "test-results",
+    "venv",
 }
 
 SEVERITY_LEVELS = ["critical", "high", "medium", "low", "informational"]
@@ -295,6 +348,338 @@ def resolve_backend(model, keys):
     return OPENAI_API_URL, api_key, model, {}
 
 
+def _resolve_codex_cli(keys):
+    cli = (
+        keys.get("_CODEX_CLI")
+        or os.environ.get("NANO_ANALYZER_CODEX_CLI")
+        or "codex"
+    )
+    has_path = os.path.sep in cli or (os.path.altsep and os.path.altsep in cli)
+    if has_path:
+        return cli if os.path.exists(cli) else None
+    return shutil.which(cli)
+
+
+def _resolve_claude_cli(keys):
+    cli = (
+        keys.get("_CLAUDE_CLI")
+        or os.environ.get("NANO_ANALYZER_CLAUDE_CLI")
+        or "claude"
+    )
+    has_path = os.path.sep in cli or (os.path.altsep and os.path.altsep in cli)
+    if has_path:
+        return cli if os.path.exists(cli) else None
+    return shutil.which(cli)
+
+
+def _looks_like_claude_model(model):
+    return model in CLAUDE_MODEL_ALIASES or model.startswith("claude-")
+
+
+def select_llm_backend(model, keys):
+    requested = keys.get("_BACKEND", "auto")
+    if requested == "api":
+        return "api"
+    if requested == "codex" or model in CODEX_MODEL_ALIASES:
+        return "codex"
+    if requested == "claude" or _looks_like_claude_model(model):
+        return "claude"
+    if "/" in model:
+        return "api"
+    if keys.get("OPENAI_API_KEY"):
+        return "api"
+    if _resolve_codex_cli(keys):
+        return "codex"
+    if _resolve_claude_cli(keys):
+        return "claude"
+    return "api"
+
+
+def configure_llm_backend(args, keys):
+    keys["_BACKEND"] = args.backend
+    keys["_CODEX_CLI"] = args.codex_cli
+    keys["_CODEX_TIMEOUT"] = args.codex_timeout
+    keys["_CLAUDE_CLI"] = args.claude_cli
+    keys["_CLAUDE_TIMEOUT"] = args.claude_timeout
+    keys["_CLAUDE_EFFORT"] = (
+        args.claude_effort
+        or os.environ.get("NANO_ANALYZER_CLAUDE_EFFORT")
+    )
+
+    backend = select_llm_backend(args.model, keys)
+    keys["_RESOLVED_BACKEND"] = backend
+
+    codex_model = args.codex_model
+    if (
+        backend == "codex"
+        and not codex_model
+        and args.model not in CODEX_MODEL_ALIASES
+        and args.model != DEFAULT_MODEL
+    ):
+        codex_model = args.model
+    if backend == "codex" and not codex_model:
+        codex_model = os.environ.get("NANO_ANALYZER_CODEX_MODEL")
+    keys["_CODEX_MODEL"] = codex_model
+
+    claude_model = args.claude_model
+    if (
+        backend == "claude"
+        and not claude_model
+        and args.model != DEFAULT_MODEL
+    ):
+        claude_model = args.model
+    if backend == "claude" and not claude_model:
+        claude_model = os.environ.get("NANO_ANALYZER_CLAUDE_MODEL")
+    keys["_CLAUDE_MODEL"] = claude_model
+
+    if backend == "codex":
+        codex_cli = _resolve_codex_cli(keys)
+        if not codex_cli:
+            print(
+                "❌ Codex backend requested, but `codex` was not found.",
+                file=sys.stderr,
+            )
+            print(
+                "   Install/login to Codex CLI or pass --codex-cli /path/to/codex.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        keys["_CODEX_CLI_PATH"] = codex_cli
+    elif backend == "claude":
+        claude_cli = _resolve_claude_cli(keys)
+        if not claude_cli:
+            print(
+                "❌ Claude backend requested, but `claude` was not found.",
+                file=sys.stderr,
+            )
+            print(
+                "   Install/login to Claude Code or pass --claude-cli /path/to/claude.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        keys["_CLAUDE_CLI_PATH"] = claude_cli
+    else:
+        resolve_backend(args.model, keys)
+
+    return backend
+
+
+def _messages_to_cli_prompt(messages, json_mode):
+    prompt = [
+        "You are the LLM completion backend for nano-analyzer.",
+        "Follow the role-tagged conversation exactly as a chat completion.",
+        "Do not modify files. Do not run shell commands. Answer only from the supplied content.",
+    ]
+    if json_mode:
+        prompt.append("Return only one valid JSON object. Do not use Markdown fences.")
+    prompt.append("\nConversation:")
+
+    for msg in messages:
+        role = msg.get("role", "user").upper()
+        content = msg.get("content", "")
+        prompt.append(f"\n<{role}>\n{content}\n</{role}>")
+
+    prompt.append("\nRespond to the final USER message.")
+    return "\n".join(prompt)
+
+
+def _call_codex_cli(model, messages, keys, json_mode=False,
+                    max_retries=3, reasoning_effort=None):
+    del reasoning_effort  # Codex CLI uses its own configured reasoning settings.
+
+    codex_cli = keys.get("_CODEX_CLI_PATH") or _resolve_codex_cli(keys)
+    if not codex_cli:
+        raise RuntimeError("Codex CLI not found")
+
+    codex_model = keys.get("_CODEX_MODEL")
+    if not codex_model and model not in CODEX_MODEL_ALIASES:
+        codex_model = os.environ.get("NANO_ANALYZER_CODEX_MODEL")
+
+    timeout = keys.get("_CODEX_TIMEOUT") or 600
+    prompt = _messages_to_cli_prompt(messages, json_mode)
+    last_error = None
+
+    for attempt in range(max_retries):
+        time.sleep(
+            random.uniform(0.1, 1.0)
+            if attempt == 0
+            else 2 ** attempt + random.uniform(0, 2)
+        )
+
+        with tempfile.TemporaryDirectory(prefix="nano-analyzer-codex-") as tmpdir:
+            out_path = os.path.join(tmpdir, "last-message.txt")
+            cmd = [
+                codex_cli, "exec",
+                "--color", "never",
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--output-last-message", out_path,
+            ]
+
+            if codex_model:
+                cmd.extend(["--model", codex_model])
+
+            if json_mode:
+                schema_path = os.path.join(tmpdir, "schema.json")
+                with open(schema_path, "w") as sf:
+                    json.dump(CODEX_JSON_OBJECT_SCHEMA, sf)
+                cmd.extend(["--output-schema", schema_path])
+
+            cmd.append("-")
+
+            try:
+                t0 = time.time()
+                semaphore = _api_semaphore or threading.Semaphore(1)
+                with semaphore:
+                    proc = subprocess.run(
+                        cmd,
+                        input=prompt,
+                        text=True,
+                        capture_output=True,
+                        timeout=timeout,
+                    )
+                elapsed = time.time() - t0
+
+                if proc.returncode != 0:
+                    detail = (proc.stderr or proc.stdout or "").strip()
+                    raise RuntimeError(
+                        f"Codex CLI failed ({proc.returncode}): {detail[-500:]}"
+                    )
+
+                content = ""
+                if os.path.exists(out_path):
+                    with open(out_path) as outf:
+                        content = outf.read().strip()
+                if not content:
+                    content = (proc.stdout or "").strip()
+                if not content:
+                    raise RuntimeError("Codex CLI returned an empty response")
+
+                return content, {}, elapsed
+
+            except (subprocess.TimeoutExpired, RuntimeError) as e:
+                last_error = e
+                if attempt == max_retries - 1:
+                    raise RuntimeError(
+                        f"Codex CLI failed after {max_retries} retries: {e}"
+                    )
+
+    raise RuntimeError(f"Codex CLI failed: {last_error}")
+
+
+def _call_claude_cli(model, messages, keys, json_mode=False,
+                     max_retries=3, reasoning_effort=None):
+    del reasoning_effort  # Claude Code uses --effort / its own config.
+
+    claude_cli = keys.get("_CLAUDE_CLI_PATH") or _resolve_claude_cli(keys)
+    if not claude_cli:
+        raise RuntimeError("Claude Code CLI not found")
+
+    claude_model = keys.get("_CLAUDE_MODEL")
+    if not claude_model and not _looks_like_claude_model(model):
+        claude_model = os.environ.get("NANO_ANALYZER_CLAUDE_MODEL")
+
+    claude_effort = (
+        keys.get("_CLAUDE_EFFORT")
+        or os.environ.get("NANO_ANALYZER_CLAUDE_EFFORT")
+    )
+    timeout = keys.get("_CLAUDE_TIMEOUT") or 600
+    prompt = _messages_to_cli_prompt(messages, json_mode)
+    last_error = None
+
+    for attempt in range(max_retries):
+        time.sleep(
+            random.uniform(0.1, 1.0)
+            if attempt == 0
+            else 2 ** attempt + random.uniform(0, 2)
+        )
+
+        with tempfile.TemporaryDirectory(prefix="nano-analyzer-claude-") as tmpdir:
+            cmd = [
+                claude_cli,
+                "--print",
+                "--no-session-persistence",
+                "--permission-mode", "dontAsk",
+                "--tools", "",
+                "--output-format", "json",
+            ]
+
+            if claude_model:
+                cmd.extend(["--model", claude_model])
+            if claude_effort:
+                cmd.extend(["--effort", claude_effort])
+            if json_mode:
+                cmd.extend(["--json-schema", json.dumps(CODEX_JSON_OBJECT_SCHEMA)])
+
+            try:
+                t0 = time.time()
+                semaphore = _api_semaphore or threading.Semaphore(1)
+                with semaphore:
+                    proc = subprocess.run(
+                        cmd,
+                        input=prompt,
+                        text=True,
+                        capture_output=True,
+                        timeout=timeout,
+                        cwd=tmpdir,
+                    )
+                elapsed = time.time() - t0
+
+                output = (proc.stdout or "").strip()
+                detail = (proc.stderr or output or "").strip()
+                if proc.returncode != 0 and not output:
+                    raise RuntimeError(
+                        f"Claude Code failed ({proc.returncode}): {detail[-500:]}"
+                    )
+
+                try:
+                    data = json.loads(output)
+                except (json.JSONDecodeError, ValueError):
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"Claude Code failed ({proc.returncode}): {detail[-500:]}"
+                        )
+                    if not output:
+                        raise RuntimeError("Claude Code returned an empty response")
+                    return output, {}, elapsed
+
+                if isinstance(data, dict) and data.get("is_error"):
+                    msg = data.get("result") or data.get("message") or detail
+                    status = data.get("api_error_status")
+                    if status in (401, 403):
+                        raise PermissionError(msg)
+                    raise RuntimeError(msg)
+
+                if isinstance(data, dict) and "result" in data:
+                    content = data.get("result")
+                    usage = data.get("usage") or {}
+                    if data.get("duration_ms"):
+                        elapsed = data["duration_ms"] / 1000
+                else:
+                    content = data
+                    usage = {}
+
+                if not isinstance(content, str):
+                    content = json.dumps(content)
+                content = content.strip()
+                if not content:
+                    raise RuntimeError("Claude Code returned an empty response")
+
+                return content, usage, elapsed
+
+            except PermissionError as e:
+                raise RuntimeError(f"Claude Code authentication failed: {e}") from e
+            except (subprocess.TimeoutExpired, RuntimeError) as e:
+                last_error = e
+                if attempt == max_retries - 1:
+                    raise RuntimeError(
+                        f"Claude Code failed after {max_retries} retries: {e}"
+                    )
+
+    raise RuntimeError(f"Claude Code failed: {last_error}")
+
+
 _http_session = None
 _http_lock = threading.Lock()
 _api_semaphore = None
@@ -318,6 +703,22 @@ def init_api_semaphore(max_concurrent):
 
 
 def call_llm(model, messages, keys, json_mode=False, max_retries=3, reasoning_effort=None):
+    backend = keys.get("_RESOLVED_BACKEND") or select_llm_backend(model, keys)
+    if backend == "codex":
+        return _call_codex_cli(
+            model, messages, keys,
+            json_mode=json_mode,
+            max_retries=max_retries,
+            reasoning_effort=reasoning_effort,
+        )
+    if backend == "claude":
+        return _call_claude_cli(
+            model, messages, keys,
+            json_mode=json_mode,
+            max_retries=max_retries,
+            reasoning_effort=reasoning_effort,
+        )
+
     api_url, api_key, model_name, extra_headers = resolve_backend(model, keys)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -590,20 +991,127 @@ def top_severity(sevs):
 # File discovery
 # ---------------------------------------------------------------------------
 
-def discover_files(path, extensions, max_chars):
+def _git_root_for_path(path):
+    """Return the git worktree root for path, or None outside git."""
+    start = path if os.path.isdir(path) else os.path.dirname(path)
+    if not start:
+        start = "."
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if proc.returncode != 0:
+        return None
+    root = proc.stdout.strip()
+    return os.path.abspath(root) if root else None
+
+
+def _git_tracked_and_unignored_files(path):
+    """List tracked plus unignored untracked files under path, if path is in git."""
+    git_root = _git_root_for_path(path)
+    if not git_root:
+        return None
+
+    abs_path = os.path.abspath(path)
+    try:
+        common = os.path.commonpath([git_root, abs_path])
+    except ValueError:
+        return None
+    if common != git_root:
+        return None
+
+    pathspec = os.path.relpath(abs_path, git_root)
+    if pathspec == ".":
+        pathspec = "."
+
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", git_root, "ls-files", "-z",
+                "--cached", "--others", "--exclude-standard",
+                "--", pathspec,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    files = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", errors="surrogateescape")
+        files.append(os.path.join(git_root, rel))
+    return files
+
+
+def _under_default_skip_dir(filepath, scan_base):
+    """True when filepath is below a default skipped directory for this scan."""
+    try:
+        rel = os.path.relpath(os.path.abspath(filepath), scan_base)
+    except ValueError:
+        return False
+    if rel == "." or rel.startswith(".."):
+        return False
+
+    parts = rel.split(os.sep)
+    for part in parts[:-1]:
+        if part in DEFAULT_SKIP_DIRS or part.endswith(".egg-info"):
+            return True
+    return False
+
+
+def discover_files(path, extensions, max_chars, respect_gitignore=True):
     """Walk a path (file or dir) and return (scannable, skipped) lists."""
     scannable = []
     skipped = []
+    abs_path = os.path.abspath(path)
+    scan_base = abs_path if os.path.isdir(path) else os.path.dirname(abs_path)
 
     if os.path.isfile(path):
-        candidates = [path]
+        candidates = (
+            _git_tracked_and_unignored_files(path)
+            if respect_gitignore else None
+        )
+        if candidates is None:
+            candidates = [path]
     else:
-        candidates = []
-        for root, _, fnames in os.walk(path):
-            for fn in sorted(fnames):
-                candidates.append(os.path.join(root, fn))
+        candidates = (
+            _git_tracked_and_unignored_files(path)
+            if respect_gitignore else None
+        )
+        if candidates is None:
+            candidates = []
+            for root, dirnames, fnames in os.walk(path):
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if d not in DEFAULT_SKIP_DIRS and not d.endswith(".egg-info")
+                )
+                for fn in sorted(fnames):
+                    candidates.append(os.path.join(root, fn))
 
-    for filepath in candidates:
+    for filepath in sorted(candidates):
+        if _under_default_skip_dir(filepath, scan_base):
+            skipped.append((filepath, "ignored directory"))
+            continue
+
+        if not os.path.isfile(filepath):
+            skipped.append((filepath, "not a regular file"))
+            continue
+
         if os.path.islink(filepath):
             skipped.append((filepath, "symlink"))
             continue
@@ -1079,18 +1587,44 @@ IIIV                     VIII
 
 
 def run_scan(args):
-    max_conn = args.max_connections or (args.parallel + args.triage_parallel)
-    init_api_semaphore(max_conn)
     keys = load_api_keys()
 
     # Discover files
     ext_set = DEFAULT_EXTENSIONS
 
-    scannable, skipped = discover_files(args.path, ext_set, args.max_chars)
+    scannable, skipped = discover_files(
+        args.path,
+        ext_set,
+        args.max_chars,
+        respect_gitignore=not args.include_ignored,
+    )
 
     if not scannable:
         print("❌ No scannable files found.")
         return
+
+    llm_backend = configure_llm_backend(args, keys)
+    if llm_backend in ("codex", "claude"):
+        parallel_explicit = getattr(args, "_parallel_explicit", False)
+        triage_parallel_explicit = getattr(args, "_triage_parallel_explicit", False)
+        if args.parallel == DEFAULT_PARALLEL and not parallel_explicit:
+            args.parallel = (
+                DEFAULT_CODEX_PARALLEL
+                if llm_backend == "codex"
+                else DEFAULT_CLAUDE_PARALLEL
+            )
+        if (
+            args.triage_parallel == DEFAULT_TRIAGE_PARALLEL
+            and not triage_parallel_explicit
+        ):
+            args.triage_parallel = (
+                DEFAULT_CODEX_PARALLEL
+                if llm_backend == "codex"
+                else DEFAULT_CLAUDE_PARALLEL
+            )
+
+    max_conn = args.max_connections or (args.parallel + args.triage_parallel)
+    init_api_semaphore(max_conn)
 
     total_lines = sum(f["lines"] for f in scannable)
     total_chars = sum(f["chars"] for f in scannable)
@@ -1144,16 +1678,42 @@ def run_scan(args):
     if skipped:
         skip_ext = sum(1 for _, r in skipped if r == "extension")
         skip_size = sum(1 for _, r in skipped if "large" in r)
-        skip_other = len(skipped) - skip_ext - skip_size
+        skip_ignored = sum(1 for _, r in skipped if r.startswith("ignored"))
+        skip_symlink = sum(1 for _, r in skipped if r == "symlink")
+        skip_irregular = sum(1 for _, r in skipped if r == "not a regular file")
+        skip_other = (
+            len(skipped)
+            - skip_ext
+            - skip_size
+            - skip_ignored
+            - skip_symlink
+            - skip_irregular
+        )
         parts = []
         if skip_ext:
             parts.append(f"{skip_ext} wrong extension")
         if skip_size:
             parts.append(f"{skip_size} too large")
+        if skip_ignored:
+            parts.append(f"{skip_ignored} ignored dirs")
+        if skip_symlink:
+            parts.append(f"{skip_symlink} symlinks")
+        if skip_irregular:
+            parts.append(f"{skip_irregular} non-files")
         if skip_other:
             parts.append(f"{skip_other} unreadable")
         print(f"   ⏭️  {len(skipped)} skipped ({', '.join(parts)})")
     print(f"🤖 Model: {args.model}")
+    if llm_backend == "codex":
+        codex_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
+        print(f"🔌 Backend: Codex CLI ({codex_model}, no API key required)")
+    elif llm_backend == "claude":
+        claude_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
+        effort = keys.get("_CLAUDE_EFFORT")
+        effort_str = f", effort {effort}" if effort else ""
+        print(f"🔌 Backend: Claude Code ({claude_model}{effort_str}, no API key required)")
+    else:
+        print("🔌 Backend: Chat Completions API")
     print(f"⚡ Parallelism: {args.parallel} scan, {args.triage_parallel} triage")
     print(f"💾 Results → {out_dir}/")
     if do_triage:
@@ -1661,10 +2221,16 @@ def run_scan(args):
 
         triage_md_path = os.path.join(out_dir, "triage_survivors.md")
         with open(triage_md_path, "w") as f:
+            model_label = args.model
+            if llm_backend == "codex":
+                model_label = keys.get("_CODEX_MODEL") or "Codex CLI default"
+            elif llm_backend == "claude":
+                model_label = keys.get("_CLAUDE_MODEL") or "Claude Code default"
+
             f.write(f"# nano-analyzer triage survivors\n\n")
             f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
             f.write(f"- **Date**: {timestamp}\n")
-            f.write(f"- **Model**: {args.model}\n")
+            f.write(f"- **Model**: {model_label}\n")
             f.write(f"- **Threshold**: {triage_threshold}+\n")
             f.write(f"- **Results**: ✅ {valid_count} valid | "
                     f"❌ {invalid_count} rejected | "
@@ -1682,10 +2248,22 @@ def run_scan(args):
         print(f"\n   📄 Triage writeup: {triage_md_path}")
 
     # Save summary
+    effective_model = args.model
+    if llm_backend == "codex":
+        effective_model = keys.get("_CODEX_MODEL") or "Codex CLI default"
+    elif llm_backend == "claude":
+        effective_model = keys.get("_CLAUDE_MODEL") or "Claude Code default"
+
     summary = {
         "timestamp": timestamp,
         "target": os.path.abspath(args.path),
         "model": args.model,
+        "effective_model": effective_model,
+        "backend": llm_backend,
+        "codex_model": keys.get("_CODEX_MODEL") if llm_backend == "codex" else None,
+        "claude_model": keys.get("_CLAUDE_MODEL") if llm_backend == "claude" else None,
+        "claude_effort": keys.get("_CLAUDE_EFFORT") if llm_backend == "claude" else None,
+        "respect_gitignore": not args.include_ignored,
         "files_scanned": len(results),
         "total_lines": total_lines,
         "wall_time_seconds": round(wall_time, 1),
@@ -1713,7 +2291,9 @@ def run_scan(args):
         f.write(f"# nano-analyzer scan results\n\n")
         f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
         f.write(f"- **Date**: {timestamp}\n")
-        f.write(f"- **Model**: {args.model}\n")
+        f.write(f"- **Model**: {effective_model}\n")
+        f.write(f"- **Backend**: {llm_backend}\n")
+        f.write(f"- **Respect gitignore**: {str(not args.include_ignored).lower()}\n")
         f.write(f"- **Files scanned**: {len(results)} ({total_lines:,} lines)\n")
         f.write(f"- **Wall time**: {wall_time:.0f}s\n\n")
         f.write("| File | Lines | Critical | High | Medium | Low |\n")
@@ -1731,6 +2311,11 @@ def run_scan(args):
 # ---------------------------------------------------------------------------
 
 def main():
+    argv = sys.argv[1:]
+
+    def flag_present(name):
+        return any(arg == name or arg.startswith(name + "=") for arg in argv)
+
     parser = argparse.ArgumentParser(
         prog="nano-analyzer",
         description="🔍 nano-analyzer: Minimal LLM-powered zero-day vulnerability scanner by AISLE",
@@ -1738,6 +2323,28 @@ def main():
     parser.add_argument("path", help="File or directory to scan")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"Model for all stages (default: {DEFAULT_MODEL})")
+    parser.add_argument("--backend", choices=("auto", "api", "codex", "claude"),
+                        default="auto",
+                        help="LLM backend: auto, api, codex, or claude (default: auto)")
+    parser.add_argument("--codex", dest="backend", action="store_const", const="codex",
+                        help="Use Codex CLI as the LLM backend (no API key required)")
+    parser.add_argument("--codex-cli", default="codex",
+                        help="Codex CLI executable for --backend codex (default: codex)")
+    parser.add_argument("--codex-model", default=None,
+                        help="Model passed to Codex CLI (default: Codex config default)")
+    parser.add_argument("--codex-timeout", type=int, default=600,
+                        help="Timeout in seconds for each Codex CLI call (default: 600)")
+    parser.add_argument("--claude", dest="backend", action="store_const", const="claude",
+                        help="Use Claude Code as the LLM backend (no API key required)")
+    parser.add_argument("--claude-cli", default="claude",
+                        help="Claude Code executable for --backend claude (default: claude)")
+    parser.add_argument("--claude-model", default=None,
+                        help="Model passed to Claude Code (default: Claude Code config default)")
+    parser.add_argument("--claude-effort", default=None,
+                        choices=("low", "medium", "high", "xhigh", "max"),
+                        help="Effort passed to Claude Code (default: Claude Code config default)")
+    parser.add_argument("--claude-timeout", type=int, default=600,
+                        help="Timeout in seconds for each Claude Code call (default: 600)")
     parser.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
                         help=f"Max concurrent scan calls (default: {DEFAULT_PARALLEL})")
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS,
@@ -1749,10 +2356,12 @@ def main():
                         help="Triage findings at or above this severity (default: medium)")
     parser.add_argument("--triage-rounds", type=int, default=5,
                         help="Triage rounds per finding (default: 5)")
-    parser.add_argument("--triage-parallel", type=int, default=50,
-                        help="Max concurrent triage calls (default: 50)")
+    parser.add_argument("--triage-parallel", type=int, default=DEFAULT_TRIAGE_PARALLEL,
+                        help="Max concurrent triage calls "
+                             f"(default: {DEFAULT_TRIAGE_PARALLEL})")
     parser.add_argument("--max-connections", type=int, default=None,
-                        help="Max total concurrent API calls (default: parallel + triage-parallel)")
+                        help="Max total concurrent LLM calls "
+                             "(default: parallel + triage-parallel)")
     parser.add_argument("--min-confidence", type=float, default=0.0,
                         help="Only show findings above this confidence threshold, "
                              "e.g. 0.7 for 70%% (default: 0, show all)")
@@ -1761,9 +2370,13 @@ def main():
     parser.add_argument("--repo-dir", default=None,
                         help="Root of the full repo for triage grep lookups "
                              "(default: parent dir for files, scan dir for folders)")
+    parser.add_argument("--include-ignored", action="store_true",
+                        help="Scan files ignored by git/.gitignore when walking a git repo")
     parser.add_argument("--verbose-triage", action="store_true",
                         help="Show per-round triage progress")
     args = parser.parse_args()
+    args._parallel_explicit = flag_present("--parallel")
+    args._triage_parallel_explicit = flag_present("--triage-parallel")
 
     if not os.path.exists(args.path):
         print(f"❌ Path not found: {args.path}", file=sys.stderr)
