@@ -1720,7 +1720,7 @@ def discover_files(path, extensions, max_chars, respect_gitignore=True, filename
             continue
 
         try:
-            with open(filepath) as f:
+            with open(filepath, encoding="utf-8-sig", errors="replace") as f:
                 content = f.read()
             line_count = content.count("\n")
             char_count = len(content)
@@ -2616,7 +2616,7 @@ def run_scan(args):
         filepath = file_info["filepath"]
         profile = language_profile_for_path(filepath)
 
-        with open(filepath) as f:
+        with open(filepath, encoding="utf-8-sig", errors="replace") as f:
             code = f.read()
 
         display_name = os.path.relpath(filepath, base_path)
