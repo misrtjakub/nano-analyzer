@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -117,6 +118,20 @@ SEVERITY_EMOJI = {
     "informational": "⚪",
     "clean": "🟢",
 }
+
+
+def terminal_file_link(path, label=None):
+    """Return an OSC 8 hyperlink for local terminal output when supported."""
+    label = label or path
+    if not sys.stdout.isatty() or os.environ.get("TERM") == "dumb":
+        return label
+    if os.environ.get("NANO_ANALYZER_NO_LINKS"):
+        return label
+    try:
+        uri = Path(path).expanduser().resolve(strict=False).as_uri()
+    except (OSError, ValueError):
+        return label
+    return f"\033]8;;{uri}\033\\{label}\033]8;;\033\\"
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -2557,8 +2572,9 @@ def run_scan(args):
     # Pre-scan summary
     print_logo()
     print("🔍 nano-analyzer vulnerability scanner")
-    print(f"📂 Target: {os.path.abspath(args.path)}")
-    print(f"🔎 Grep dir: {repo_dir}")
+    print("🛠️  Modified version: misrtjakub")
+    print(f"📂 Target: {terminal_file_link(os.path.abspath(args.path))}")
+    print(f"🔎 Grep dir: {terminal_file_link(repo_dir)}")
     print(f"📄 {len(scannable)} files to scan ({total_lines:,} lines, {total_chars:,} chars)")
     if skipped:
         skip_ext = sum(1 for _, r in skipped if r == "extension")
@@ -2598,7 +2614,7 @@ def run_scan(args):
     else:
         print("🔌 Backend: Chat Completions API")
     print(f"⚡ Parallelism: {args.parallel} scan, {args.triage_parallel} triage")
-    print(f"💾 Results → {out_dir}/")
+    print(f"💾 Results → {terminal_file_link(out_dir, out_dir + os.sep)}")
     if do_triage:
         rounds_str = f", {triage_rounds} rounds" if triage_rounds > 1 else ""
         print(f"🔬 Triage: {triage_threshold}+ findings → skeptical review ({rounds_str.lstrip(', ')})" if triage_rounds > 1 else f"🔬 Triage: {triage_threshold}+ findings → skeptical review")
@@ -2685,8 +2701,8 @@ def run_scan(args):
                 else:
                     print(f"  {ts} [file {completed:>{cw}}/{total}] ⬜ {short_name}  {elapsed:.0f}s  {load}")
                 if result["status"] == "ok":
-                    print(f"         📋 {ctx_link}")
-                    print(f"         📄 {scan_link}")
+                    print(f"         📋 {terminal_file_link(ctx_link)}")
+                    print(f"         📄 {terminal_file_link(scan_link)}")
 
         # Queue triage work (non-blocking — fires and forgets into triage executor)
         result["_triage_pending"] = []
@@ -2929,7 +2945,7 @@ def run_scan(args):
                             print(f"  {ts} 🔬 [triage {tc}/{tt}] {emoji} {conf_pct}% [{verdicts_str}]{grep_icon} {t_short}: {short_title}  {load}")
                         else:
                             print(f"  {ts} 🔬 [triage {tc}/{tt}] {emoji}{grep_icon} {t_short}: {short_title}  {load}")
-                        print(f"         📄 {triage_md}")
+                        print(f"         📄 {terminal_file_link(triage_md)}")
 
                         if final_tv["verdict"] == "VALID":
                             triage_valid_count[0] += 1
@@ -3014,7 +3030,7 @@ def run_scan(args):
     print(f"   🟢 Clean:    {len(clean_files)} files")
     if error_files:
         print(f"   ❌ Errors:   {len(error_files)} files")
-    print(f"💾 Results saved to: {out_dir}/")
+    print(f"💾 Results saved to: {terminal_file_link(out_dir, out_dir + os.sep)}")
 
     # Triage summary
     if all_triage_results:
@@ -3103,7 +3119,7 @@ def run_scan(args):
                     arbiter_emoji = {"V": "✅", "I": "❌"}.get(arbiter_v, "❓")
                     arbiter_str = f" (arbiter: {arbiter_emoji})"
                 print(f"      {bar} {conf_pct}% [{vs}]{arbiter_str} {t['file']}: {t['finding_title']}")
-                print(f"         📄 {finding_path}")
+                print(f"         📄 {terminal_file_link(finding_path)}")
 
         with open(os.path.join(out_dir, "triage.json"), "w") as f:
             json.dump(all_triage_results, f, indent=2)
@@ -3130,7 +3146,7 @@ def run_scan(args):
                 f.write(t["reasoning"])
                 f.write("\n\n---\n\n")
 
-        print(f"\n   📄 Triage writeup: {triage_md_path}")
+        print(f"\n   📄 Triage writeup: {terminal_file_link(triage_md_path)}")
 
     # Save summary
     summary = {
