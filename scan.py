@@ -21,6 +21,7 @@ Usage:
   python3 scan.py ./src --model gpt-5.4   # use a different API/Codex model
   python3 scan.py ./src --claude-model sonnet --claude-effort high
   python3 scan.py ./src --parallel 30     # control scan concurrency
+  python3 scan.py ./src --no-triage       # skip skeptical triage
   python3 scan.py ./src --include-ignored # include gitignored files
 """
 
@@ -71,6 +72,7 @@ DEFAULT_TRIAGE_PARALLEL = 50
 DEFAULT_CODEX_PARALLEL = 4
 DEFAULT_CLAUDE_PARALLEL = 4
 DEFAULT_MAX_CHARS = 200_000
+DEFAULT_PROGRESS_INTERVAL = 30
 DEFAULT_EXTENSIONS = {
     ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx",
     ".java", ".py", ".pyi", ".go", ".rs",
@@ -1954,7 +1956,7 @@ def collect_repo_manifest_context(repo_dir, max_chars=2500):
 # ---------------------------------------------------------------------------
 
 def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None,
-                     profile=None, repo_context=None):
+                     profile=None, repo_context=None, progress_cb=None):
     """Run the two-stage scan on a single file. Returns result dict."""
     profile = profile or language_profile_for_path(filepath)
     repo_context = repo_context or "(repo context unavailable)"
@@ -1967,6 +1969,9 @@ def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None,
     }
 
     try:
+        if progress_cb:
+            progress_cb("context")
+
         # Stage 1: generate context (with optional grep)
         context_prompt = CONTEXT_GEN_PROMPT_TEMPLATE.format(
             language_name=profile["name"],
@@ -1993,6 +1998,9 @@ def scan_single_file(filepath, code, display_name, model, keys, repo_dir=None,
         result["context"] = context
         result["context_tokens"] = ctx_usage.get("total_tokens", 0)
         result["context_elapsed"] = round(ctx_elapsed, 1)
+
+        if progress_cb:
+            progress_cb("scan")
 
         # Stage 2: vulnerability scan (with few-shot example)
         scan_system_prompt = SCAN_SYSTEM_PROMPT_TEMPLATE.format(
@@ -2552,7 +2560,7 @@ def run_scan(args):
     os.makedirs(out_dir, exist_ok=True)
 
     # Triage config
-    triage_threshold = args.triage_threshold
+    triage_threshold = None if args.no_triage else args.triage_threshold
     triage_rounds = args.triage_rounds
     project_name = args.project or os.path.basename(os.path.abspath(args.path))
     if args.repo_dir:
@@ -2568,6 +2576,9 @@ def run_scan(args):
     triage_valid_count = [0]
     triage_invalid_count = [0]
     triage_uncertain_count = [0]
+    scan_stages = {}
+    triage_stages = {}
+    progress_interval = max(0, args.progress_interval)
 
     # Pre-scan summary
     print_logo()
@@ -2618,6 +2629,12 @@ def run_scan(args):
     if do_triage:
         rounds_str = f", {triage_rounds} rounds" if triage_rounds > 1 else ""
         print(f"🔬 Triage: {triage_threshold}+ findings → skeptical review ({rounds_str.lstrip(', ')})" if triage_rounds > 1 else f"🔬 Triage: {triage_threshold}+ findings → skeptical review")
+    else:
+        print("🔬 Triage: disabled")
+    if progress_interval:
+        print(f"⏱️  Progress heartbeat: every {progress_interval}s")
+        if llm_backend in ("codex", "claude"):
+            print("   CLI backend output is captured until each model call finishes.")
     print()
 
     # Run scans (and inline triage)
@@ -2626,6 +2643,54 @@ def run_scan(args):
     completed = 0
     total = len(scannable)
     scan_start = time.time()
+    progress_stop = threading.Event()
+
+    def _short_progress_text(text, limit=32):
+        text = str(text).replace("\n", " ")
+        return text if len(text) <= limit else text[:limit - 3] + "..."
+
+    def progress_monitor():
+        while not progress_stop.wait(progress_interval):
+            with print_lock:
+                scans_done = completed >= total
+                triages_done = (not do_triage) or triage_counter[0] >= triage_total[0]
+                if scans_done and triages_done:
+                    continue
+
+                elapsed = time.time() - scan_start
+                sc = active_scans[0]
+                tc = active_triages[0]
+                ts = datetime.now().strftime("%H:%M:%S")
+                triage_part = (
+                    f", triage {triage_counter[0]}/{triage_total[0]}"
+                    if do_triage
+                    else ""
+                )
+                print(
+                    f"  {ts} ⏳ still running {elapsed:.0f}s  "
+                    f"files {completed}/{total}{triage_part}  "
+                    f"[LLMs running S:{sc} T:{tc}]"
+                )
+
+                active = []
+                for name, stage in list(scan_stages.items())[:3]:
+                    active.append(f"{os.path.basename(name)}:{stage}")
+                remaining_slots = max(0, 3 - len(active))
+                for (_file, title), stage in list(triage_stages.items())[:remaining_slots]:
+                    active.append(f"triage:{stage}:{_short_progress_text(title, 28)}")
+                extra = len(scan_stages) + len(triage_stages) - len(active)
+                if active:
+                    suffix = f", +{extra} more" if extra > 0 else ""
+                    print(f"         active: {', '.join(active)}{suffix}")
+
+    progress_thread = None
+    if progress_interval:
+        progress_thread = threading.Thread(
+            target=progress_monitor,
+            name="nano-analyzer-progress",
+            daemon=True,
+        )
+        progress_thread.start()
 
     def process_file(file_info):
         nonlocal completed
@@ -2636,9 +2701,16 @@ def run_scan(args):
             code = f.read()
 
         display_name = os.path.relpath(filepath, base_path)
+        short_name = os.path.basename(filepath)
+
+        def update_scan_stage(stage):
+            with print_lock:
+                if display_name in scan_stages:
+                    scan_stages[display_name] = stage
 
         with print_lock:
             active_scans[0] += 1
+            scan_stages[display_name] = "context"
         try:
             result = scan_single_file(
                 filepath, code, display_name,
@@ -2646,10 +2718,12 @@ def run_scan(args):
                 repo_dir=repo_dir,
                 profile=profile,
                 repo_context=repo_context,
+                progress_cb=update_scan_stage,
             )
         finally:
             with print_lock:
                 active_scans[0] -= 1
+                scan_stages.pop(display_name, None)
 
         result["lines"] = file_info["lines"]
         result["chars"] = file_info["chars"]
@@ -2677,7 +2751,6 @@ def run_scan(args):
         with print_lock:
             completed += 1
             sevs = result["severities"]
-            short_name = os.path.basename(filepath)
             elapsed = result.get("total_elapsed", 0)
             cw = len(str(total))
 
@@ -2736,12 +2809,14 @@ def run_scan(args):
                             print(f"  {ts} ❌ TRIAGE ERROR {t_short}: {t_title[:40]}... — {e}")
 
                 def _triage_one_finding_inner(t_title, t_text, t_code, t_display, t_short):
+                    triage_key = (t_display, t_title)
                     round_verdicts = []
                     prior = None
                     for rn in range(1, triage_rounds + 1):
                         with triage_semaphore:
                             with print_lock:
                                 active_triages[0] += 1
+                                triage_stages[triage_key] = f"round {rn}/{triage_rounds}"
                             try:
                                 tv = triage_finding(
                                     t_title, t_text, t_code, t_display,
@@ -2760,6 +2835,7 @@ def run_scan(args):
                             finally:
                                 with print_lock:
                                     active_triages[0] -= 1
+                                    triage_stages.pop(triage_key, None)
                         tv["file"] = t_display
                         tv["round"] = rn
                         round_verdicts.append(tv)
@@ -2853,6 +2929,7 @@ def run_scan(args):
                             with triage_semaphore:
                                 with print_lock:
                                     active_triages[0] += 1
+                                    triage_stages[triage_key] = "arbiter"
                                 try:
                                     arbiter_resp, _, _ = call_llm(
                                         args.model,
@@ -2865,6 +2942,7 @@ def run_scan(args):
                                 finally:
                                     with print_lock:
                                         active_triages[0] -= 1
+                                        triage_stages.pop(triage_key, None)
 
                             arbiter_parsed = _extract_json(arbiter_resp)
                             if isinstance(arbiter_parsed, dict):
@@ -2981,22 +3059,27 @@ def run_scan(args):
     max_conn = args.max_connections or (args.parallel + args.triage_parallel)
     triage_executor = ThreadPoolExecutor(max_workers=max_conn) if do_triage else None
 
-    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        futures = {executor.submit(process_file, fi): fi for fi in scannable}
-        for future in as_completed(futures):
-            results.append(future.result())
+    try:
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {executor.submit(process_file, fi): fi for fi in scannable}
+            for future in as_completed(futures):
+                results.append(future.result())
 
-    # Scans done — release scan capacity into the triage semaphore so
-    # triage can use all available connections.
-    if triage_executor:
-        if triage_semaphore:
-            for _ in range(args.parallel):
-                triage_semaphore.release()
-        remaining = triage_total[0] - triage_counter[0]
-        if remaining > 0:
-            max_conn = args.max_connections or (args.parallel + args.triage_parallel)
-            print(f"\n⏳ Scans complete. {remaining} triages remaining (full capacity: {max_conn} connections)...")
-        triage_executor.shutdown(wait=True)
+        # Scans done — release scan capacity into the triage semaphore so
+        # triage can use all available connections.
+        if triage_executor:
+            if triage_semaphore:
+                for _ in range(args.parallel):
+                    triage_semaphore.release()
+            remaining = triage_total[0] - triage_counter[0]
+            if remaining > 0:
+                max_conn = args.max_connections or (args.parallel + args.triage_parallel)
+                print(f"\n⏳ Scans complete. {remaining} triages remaining (full capacity: {max_conn} connections)...")
+            triage_executor.shutdown(wait=True)
+    finally:
+        progress_stop.set()
+        if progress_thread:
+            progress_thread.join(timeout=1)
 
     wall_time = time.time() - scan_start
 
@@ -3259,6 +3342,8 @@ def main():
     parser.add_argument("--triage-threshold", default="medium",
                         choices=SEVERITY_LEVELS[:4],
                         help="Triage findings at or above this severity (default: medium)")
+    parser.add_argument("--no-triage", action="store_true",
+                        help="Skip skeptical triage after the initial scan")
     parser.add_argument("--triage-rounds", type=int, default=5,
                         help="Triage rounds per finding (default: 5)")
     parser.add_argument("--triage-parallel", type=int, default=DEFAULT_TRIAGE_PARALLEL,
@@ -3279,6 +3364,10 @@ def main():
                         help="Scan files ignored by git/.gitignore when walking a git repo")
     parser.add_argument("--verbose-triage", action="store_true",
                         help="Show per-round triage progress")
+    parser.add_argument("--progress-interval", type=int,
+                        default=DEFAULT_PROGRESS_INTERVAL,
+                        help="Seconds between progress heartbeats; 0 disables "
+                             f"(default: {DEFAULT_PROGRESS_INTERVAL})")
     args = parser.parse_args()
     args._parallel_explicit = flag_present("--parallel")
     args._triage_parallel_explicit = flag_present("--triage-parallel")
