@@ -1114,7 +1114,7 @@ def _call_codex_cli(model, messages, keys, json_mode=False,
 
             if json_mode:
                 schema_path = os.path.join(tmpdir, "schema.json")
-                with open(schema_path, "w") as sf:
+                with open(schema_path, "w", encoding="utf-8") as sf:
                     json.dump(CODEX_JSON_OBJECT_SCHEMA, sf)
                 cmd.extend(["--output-schema", schema_path])
 
@@ -1128,6 +1128,8 @@ def _call_codex_cli(model, messages, keys, json_mode=False,
                         cmd,
                         input=prompt,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         capture_output=True,
                         timeout=timeout,
                     )
@@ -1141,7 +1143,7 @@ def _call_codex_cli(model, messages, keys, json_mode=False,
 
                 content = ""
                 if os.path.exists(out_path):
-                    with open(out_path) as outf:
+                    with open(out_path, encoding="utf-8", errors="replace") as outf:
                         content = outf.read().strip()
                 if not content:
                     content = (proc.stdout or "").strip()
@@ -1212,6 +1214,8 @@ def _call_claude_cli(model, messages, keys, json_mode=False,
                         cmd,
                         input=prompt,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         capture_output=True,
                         timeout=timeout,
                         cwd=tmpdir,
@@ -2735,16 +2739,16 @@ def run_scan(args):
         json_path = os.path.join(out_dir, f"{safename}.json")
 
         if result["status"] == "ok":
-            with open(md_path, "w") as f:
+            with open(md_path, "w", encoding="utf-8") as f:
                 f.write(f"# Scan: {display_name}\n\n")
                 f.write(result["report"])
 
             ctx_md_path = os.path.join(out_dir, f"{safename}.context.md")
-            with open(ctx_md_path, "w") as f:
+            with open(ctx_md_path, "w", encoding="utf-8") as f:
                 f.write(f"# Context: {display_name}\n\n")
                 f.write(result.get("context", "(no context generated)"))
 
-            with open(json_path, "w") as f:
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2)
 
         # Live scan output
@@ -2990,7 +2994,7 @@ def run_scan(args):
                         tt = triage_total[0]
 
                     triage_md = os.path.join(triage_dir, f"T{tc:04d}_{safe_file}_{safe_title}.md")
-                    with open(triage_md, "w") as tf:
+                    with open(triage_md, "w", encoding="utf-8") as tf:
                         tf.write(f"# Triage T{tc:04d}: {final_tv['finding_title']}\n\n")
                         tf.write(f"- **File**: `{t_display}`\n")
                         tf.write(f"- **Verdict**: {final_tv['verdict']}\n")
@@ -3159,7 +3163,7 @@ def run_scan(args):
                 finding_filename = f"VULN-{idx:03d}_{safename}.md"
                 finding_path = os.path.join(findings_dir, finding_filename)
 
-                with open(finding_path, "w") as ff:
+                with open(finding_path, "w", encoding="utf-8") as ff:
                     ff.write(f"# VULN-{idx:03d}: {t['finding_title']}\n\n")
                     ff.write(f"- **File**: `{t['file']}`\n")
                     ff.write(f"- **Confidence**: {conf_pct}%")
@@ -3204,11 +3208,11 @@ def run_scan(args):
                 print(f"      {bar} {conf_pct}% [{vs}]{arbiter_str} {t['file']}: {t['finding_title']}")
                 print(f"         📄 {terminal_file_link(finding_path)}")
 
-        with open(os.path.join(out_dir, "triage.json"), "w") as f:
+        with open(os.path.join(out_dir, "triage.json"), "w", encoding="utf-8") as f:
             json.dump(all_triage_results, f, indent=2)
 
         triage_md_path = os.path.join(out_dir, "triage_survivors.md")
-        with open(triage_md_path, "w") as f:
+        with open(triage_md_path, "w", encoding="utf-8") as f:
             f.write(f"# nano-analyzer triage survivors\n\n")
             f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
             f.write(f"- **Date**: {timestamp}\n")
@@ -3268,11 +3272,11 @@ def run_scan(args):
             for r in results
         ],
     }
-    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     # Human-readable summary
-    with open(os.path.join(out_dir, "summary.md"), "w") as f:
+    with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
         f.write(f"# nano-analyzer scan results\n\n")
         f.write(f"- **Target**: `{os.path.abspath(args.path)}`\n")
         f.write(f"- **Date**: {timestamp}\n")
